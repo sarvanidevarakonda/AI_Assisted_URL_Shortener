@@ -72,8 +72,34 @@ For each component:
 
 ## Component: `models.py`
 
-**Status:** IN PROGRESS — not yet started
+**Prompt used:**
+> "Create a file called models.py with a SQLAlchemy model called URLMapping.
+> Import Base from database.
+> Columns:
+> - id: Integer, primary key
+> - original_url: String, not null
+> - short_code: String, unique, indexed
+> - created_at: DateTime, default=datetime.utcnow
+> - click_count: Integer, default=0
+> Add a __repr__ method for debugging."
 
+**Copilot output summary:**
+- Generated the URLMapping class with all requested columns and __repr__.
+- Used `datetime.utcnow` as the default for `created_at`.
+- `short_code` had `unique=True` and `index=True` but not `nullable=False`.
+- Left a stray `created_at = Column(...)` line at the top of the file, outside any class.
+
+**My review and changes:**
+- Removed the stray top-level `created_at` line (would raise NameError on import).
+- Added `from datetime import datetime, timezone` — missing from Copilot's output.
+- Replaced deprecated `datetime.utcnow` with `datetime.now(timezone.utc)`.
+- Added `nullable=False` to `short_code` (a short code must always exist).
+
+**Validation:**
+- Syntax check: PASS
+- Runtime import (`python -c "import models"`): PASS
+- Introspection check: `URLMapping.short_code.unique=True`, `index=True`, `nullable=False`
+- Tests: N/A (model only; will be exercised in test_main.py)
 ---
 
 ## Component: `schemas.py`
@@ -121,6 +147,7 @@ For each component:
 | Component | Accepted as-is | Modified | Rejected | Notes |
 |-----------|---------------|----------|----------|-------|
 | database.py | ✅ | | | |
+| models.py | | ✅ | | fixed deprecated API + added nullable constraint |
 
 ---
 
@@ -132,6 +159,7 @@ For each component:
 | Duplicate URL creation | Functional | (planned) idempotent check in POST /shorten |
 | SQLite thread-safety | Runtime | `check_same_thread=False` set in database.py |
 | Missing dependency | Build | Added SQLAlchemy to requirements.txt |
+| Deprecated `datetime.utcnow` | Maintainability | Replaced with `datetime.now(timezone.utc)` |
 
 ---
 
