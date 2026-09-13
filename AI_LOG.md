@@ -152,7 +152,31 @@ For each component:
 
 ## Component: `main.py`
 
-**Status:** NOT STARTED
+**Prompt used:**
+> "Create main.py with a FastAPI app for a URL shortener.
+> ... [full prompt as given]"
+
+**Copilot output summary:**
+- Generated FastAPI app with POST /shorten, GET /{short_code},
+  GET /analytics/{short_code}.
+- Base.metadata.create_all(bind=engine) at startup.
+- Uses secrets module for short code generation.
+- Idempotent behavior: existing URL returns same short_code.
+- Retry loop on IntegrityError for code collisions.
+- Redirects with 307; increments click_count.
+
+**My review and changes:**
+- [Fill in: anything you changed]
+
+**Validation:**
+- Syntax check: PASS (`python -m py_compile main.py`)
+- App import: PASS (`from main import app` → N routes)
+- Smoke tests: PASS
+  - POST /shorten → 200, returns short_code
+  - POST /shorten duplicate → same short_code (idempotent)
+  - GET /{code} → 307 redirect
+  - GET /analytics/{code} → click_count incremented
+  - GET /{invalid} → 404
 
 ---
 
@@ -191,7 +215,7 @@ For each component:
 | database.py | ✅ | | | |
 | models.py | | ✅ | | fixed deprecated API + added nullable constraint |
 | schemas.py | ✅ | | | |
-
+| main.py | ✅ | | | |
 ---
 
 ## Key Risks Identified and Mitigated
@@ -204,6 +228,8 @@ For each component:
 | Missing dependency | Build | Added SQLAlchemy to requirements.txt |
 | Deprecated `datetime.utcnow` | Maintainability | Replaced with `datetime.now(timezone.utc)` |
 | Invalid URL input | Functional | Pydantic field_validator rejects non-http(s) URLs |
+| Short code collision | Functional | Retry loop on IntegrityError (max 3 attempts) |
+| Missing 404 handling | Functional | HTTPException 404 for missing short codes |
 
 ---
 
