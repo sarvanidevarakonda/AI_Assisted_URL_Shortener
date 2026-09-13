@@ -1,5 +1,6 @@
 import secrets
 import string
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
@@ -11,13 +12,14 @@ from models import URLMapping
 from schemas import AnalyticsResponse, URLRequest, URLResponse
 
 
-app = FastAPI()
-
-
-@app.on_event("startup")
-def create_tables() -> None:
-    """Create database tables when the application starts."""
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Create database tables during application startup."""
     Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def _build_url_response(mapping: URLMapping) -> URLResponse:

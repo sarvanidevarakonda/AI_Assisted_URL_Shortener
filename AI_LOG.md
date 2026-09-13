@@ -178,11 +178,58 @@ For each component:
   - GET /analytics/{code} → click_count incremented
   - GET /{invalid} → 404
 
+  **Post-review refactor:**
+- FastAPI's `@app.on_event("startup")` is deprecated in favor of
+  lifespan context managers.
+- Prompted Copilot to refactor to `@asynccontextmanager` with
+  `Base.metadata.create_all(bind=engine)` before `yield`, passed to
+  `FastAPI(lifespan=lifespan)`.
+- Verified: 7 tests still pass; the `main.py:17` deprecation warning
+  no longer appears in pytest output (warnings dropped from 4 to 2).
+- Remaining warnings (Starlette/httpx, anyio.BlockingPortal) are
+  upstream library issues, not project code. Documented as known
+  limitations rather than fixed, to avoid patching third-party packages.
+
 ---
 
 ## Component: `tests/test_main.py`
 
-**Status:** NOT STARTED
+**Prompt used:**
+> "Create tests/test_main.py with pytest tests for the FastAPI URL shortener.
+> Use FastAPI's TestClient. Use a temporary SQLite database for tests so
+> the real shortener.db is not touched. Override the get_db dependency
+> to use the test database.
+>
+> Test cases:
+> 1. test_shorten_valid_url — 200, contains short_code/short_url/original_url
+> 2. test_shorten_idempotent — same URL returns same short_code
+> 3. test_shorten_invalid_url — 422
+> 4. test_redirect_valid_code — 307 + location header
+> 5. test_redirect_invalid_code — 404
+> 6. test_analytics_increments — click_count == 1 after one redirect
+> 7. test_analytics_invalid_code — 404
+>
+> Use pytest fixtures for the test client and test database.
+> Clean up after each test."
+
+**Copilot output summary:**
+- Created 7 test functions matching the requested cases.
+- Used function-scoped fixtures with a temporary SQLite database.
+- Overrode the get_db dependency for isolation from production DB.
+
+**My review and changes:**
+- [Fill in: any changes you made, or "None needed"]
+
+**Validation:**
+- Initial run via `pytest tests/test_main.py -q` failed: pytest launcher
+  did not put repo root on sys.path, so `main` could not be imported.
+- Diagnosis: use `python -m pytest` instead, which uses the active
+  interpreter's import path. This was the correct minimal fix — no test
+  code changes needed.
+- Re-ran: `python -m pytest tests/test_main.py -q` → **7 passed**
+- Deprecation warnings from FastAPI/Starlette noted but not blocking.
+- Whitespace check: `git diff --check` → clean.
+- Confirmed real `shortener.db` untouched (tests use temp DB via override).
 
 ---
 
@@ -216,6 +263,8 @@ For each component:
 | models.py | | ✅ | | fixed deprecated API + added nullable constraint |
 | schemas.py | ✅ | | | |
 | main.py | ✅ | | | |
+| tests/test_main.py | ✅ | | | |
+| Deprecated `@app.on_event("startup")` | Maintainability | Refactored to `@asynccontextmanager` lifespan handler |
 ---
 
 ## Key Risks Identified and Mitigated
@@ -230,14 +279,23 @@ For each component:
 | Invalid URL input | Functional | Pydantic field_validator rejects non-http(s) URLs |
 | Short code collision | Functional | Retry loop on IntegrityError (max 3 attempts) |
 | Missing 404 handling | Functional | HTTPException 404 for missing short codes |
-
+| Test DB contamination of production DB | Test isolation | Dependency override with temp SQLite per test |
+| pytest path issues | Build | Use `python -m pytest` (adds repo root to sys.path) |
 ---
 
 ## Assumptions and Limitations
 
 - SQLite used for simplicity; production would use PostgreSQL.
 - No authentication / rate limiting implemented yet.
-- [Add more as you go]
+- - SQLite used for simplicity; production would use PostgreSQL.
+- No authentication / rate limiting implemented yet.
+- Short codes are 6 characters (space of ~56 billion); acceptable for prototype.
+- Analytics limited to total click_count; no time-series or per-IP data.
+- FastAPI/Starlette emit deprecation warnings about httpx and anyio
+  aliases. These are upstream and not caused by project code.
+- The `on_event` deprecation was caused by project code and was
+  refactored to a lifespan handler.
+
 
 ---
 
