@@ -1,9 +1,9 @@
 # AI Assistance Log
 
 **Project:** AI-Assisted URL Shortener Service  
-**Candidate:** [Sarvani Devarakonda]  
+**Candidate:** Sarvani Devarakonda  
 **AI Tool:** GitHub Copilot (Agent Mode)  
-**Date Started:** [2026-09-13]
+**Date Started:** 2026-09-13
 
 ---
 
@@ -91,6 +91,28 @@ For each component:
 ## Component: `tests/test_main.py`
 
 **Status:** NOT STARTED
+
+---
+
+## Version Control Setup
+
+**Action:** Initialized Git repository and made first commit.
+
+**Files tracked:**
+- `.gitignore`
+- `.github/copilot-instructions.md`
+- `AI_LOG.md`
+- `database.py`
+- `requirements.txt`
+
+**Files excluded (via .gitignore):**
+- `.venv/` (virtual environment)
+- `__pycache__/` (Python bytecode cache)
+- `*.db` (local SQLite database)
+
+**Commit:** `Initial commit: database.py, AI log, project setup`
+
+**Validation:** `git log --oneline` shows commit; `git status` shows clean tree.
 
 ---
 
