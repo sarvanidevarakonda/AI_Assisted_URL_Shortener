@@ -104,7 +104,49 @@ For each component:
 
 ## Component: `schemas.py`
 
-**Status:** NOT STARTED
+**Prompt used:**
+> "Create a file called schemas.py with Pydantic models for the URL shortener.
+> Use Pydantic v2 syntax.
+>
+> Models needed:
+> 1. URLRequest:
+>    - original_url: str
+>    - A field_validator that ensures the URL starts with 'http://' or 'https://'
+>    - If invalid, raise ValueError with a clear message
+> 2. URLResponse:
+>    - short_code: str
+>    - short_url: str
+>    - original_url: str
+> 3. AnalyticsResponse:
+>    - original_url: str
+>    - short_code: str
+>    - click_count: int
+>    - created_at: datetime
+>
+> Use model_config = ConfigDict(from_attributes=True) where appropriate
+> so Pydantic can read from SQLAlchemy objects."
+
+**Copilot output summary:**
+- Generated URLRequest, URLResponse, AnalyticsResponse with Pydantic v2 syntax.
+- URLRequest includes a field_validator for http:// and https://.
+- Response models use ConfigDict(from_attributes=True).
+
+**My review and changes:**
+- Verified Pydantic v2 imports (`field_validator`, `ConfigDict`), no v1 `@validator`.
+- Validator correctly rejects strings not starting with http:// or https://.
+- No functional changes needed.
+
+**Validation:**
+- Syntax check: PASS
+- Runtime import (`python -c "import schemas"`): PASS
+- Valid URL (`https://example.com`): PASS — model constructed
+- Invalid URL (`notaurl`): PASS — raised ValidationError with custom message
+
+**Note on Copilot limitation:**
+- Copilot Agent Mode reported "Pydantic not installed" during its own
+  runtime check, but `pip show pydantic` confirmed v2.13.5 was installed
+  in the active venv. Copilot's terminal context does not always inherit
+  the venv, so its runtime claims are not authoritative. Verified manually.
 
 ---
 
@@ -148,6 +190,7 @@ For each component:
 |-----------|---------------|----------|----------|-------|
 | database.py | ✅ | | | |
 | models.py | | ✅ | | fixed deprecated API + added nullable constraint |
+| schemas.py | ✅ | | | |
 
 ---
 
@@ -160,6 +203,7 @@ For each component:
 | SQLite thread-safety | Runtime | `check_same_thread=False` set in database.py |
 | Missing dependency | Build | Added SQLAlchemy to requirements.txt |
 | Deprecated `datetime.utcnow` | Maintainability | Replaced with `datetime.now(timezone.utc)` |
+| Invalid URL input | Functional | Pydantic field_validator rejects non-http(s) URLs |
 
 ---
 
