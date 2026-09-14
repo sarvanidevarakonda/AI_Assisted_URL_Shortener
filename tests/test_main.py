@@ -81,6 +81,35 @@ def test_redirect_valid_code(client):
     assert response.headers["location"] == url
 
 
+def test_redirect_cache_hit_uses_cached_url_and_increments_clicks(client, monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.set_calls = []
+
+        def get(self, key):
+            assert key.startswith("url:")
+            return "https://cached.example.com"
+
+        def set(self, *args, **kwargs):
+            self.set_calls.append((args, kwargs))
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(main, "redis_client", fake_redis)
+
+    shorten_response = client.post(
+        "/shorten", json={"original_url": "https://example.com"}
+    )
+    short_code = shorten_response.json()["short_code"]
+
+    response = client.get(f"/{short_code}", follow_redirects=False)
+    analytics_response = client.get(f"/analytics/{short_code}")
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "https://cached.example.com"
+    assert analytics_response.json()["click_count"] == 1
+    assert fake_redis.set_calls == []
+
+
 def test_redirect_invalid_code(client):
     response = client.get("/nonexistent")
 

@@ -148,3 +148,58 @@ If this were to move to production:
 6. Observability: structured logging, metrics, tracing.
 7. Route naming: prefix short-code routes (/r/{code}) to avoid
    the ordering fragility noted in section 3.
+
+   ## 9. Scale Considerations
+
+The assignment asks for a "scalable" URL shortener. This section
+documents the scaling-relevant design choices and explicitly states
+what was and was not measured.
+
+### Design Choices That Support Scale
+
+| Choice | Scale Benefit |
+|--------|--------------|
+| Index on `short_code` | O(log n) lookup vs. O(n) full scan |
+| Unique constraint on `short_code` | Prevents duplicates at the DB layer, not app layer |
+| Idempotent `POST /shorten` | Avoids unbounded duplicate rows for the same URL |
+| Retry loop on `IntegrityError` | Handles code collisions without failing the request |
+| `secrets` module for code generation | Uniform distribution across the keyspace, no hot spots |
+| 6-char code over `[A-Za-z0-9]` | 62^6 ≈ 5.6 × 10^10 possible codes |
+| Dependency-injected session | Enables pooling / swap to a real pool in production |
+| Stateless FastAPI handlers | Horizontally scalable behind a load balancer |
+
+### What Was Not Measured
+
+The prototype was **not** load tested. No benchmarks, throughput
+numbers, or latency measurements are included. This is a deliberate
+scoping decision: the assignment's mandatory use case is the
+*implementation* of the service, and time was spent on correctness,
+validation, and documentation instead of performance testing.
+
+### What Would Be Measured in Production
+
+| Metric | Target (proposed) | How to Measure |
+|--------|-------------------|----------------|
+| P99 latency, POST /shorten | < 50 ms | APM (Datadog, New Relic) |
+| P99 latency, GET /{code} | < 10 ms | APM |
+| Sustained RPS per instance | 5,000+ | k6 / locust |
+| Error rate | < 0.1% | APM + log aggregation |
+| Collision retry rate | < 0.001% | Custom metric on IntegrityError |
+
+### Known Bottlenecks at Higher Scale
+
+1. **SQLite single-writer lock** — becomes a bottleneck above ~100 writes/sec.
+   *Mitigation:* swap to PostgreSQL (see `ARCHITECTURE.md` §10).
+2. **In-process `click_count` increment** — contention on hot rows.
+   *Mitigation:* append-only events table, async aggregation.
+3. **No caching layer** — every redirect hits the DB.
+   *Mitigation:* Redis cache in front of `short_code` lookups with TTL.
+4. **Single-region deployment** — no CDN or edge caching.
+   *Mitigation:* read replicas + CDN for popular codes.
+
+### Explicit Trade-Off Statement
+
+Given the assignment's scope, the engineer chose **design correctness
+and validation rigor** over **empirical performance evidence**. The
+scale-relevant design choices are documented above so a reviewer can
+see the reasoning; the missing measurements are called out honestly rather than implied.

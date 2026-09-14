@@ -7,7 +7,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from database import Base, engine, get_db
+from database import Base, engine, get_db, redis_client
 from models import URLMapping
 from schemas import AnalyticsResponse, URLRequest, URLResponse
 
@@ -85,6 +85,25 @@ def shorten_url(request: URLRequest, db: Session = Depends(get_db)) -> URLRespon
 def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> RedirectResponse:
     """Redirect to the original URL and increment its click count."""
     try:
+        cache_key = f"url:{short_code}"
+        try:
+            cached_url = redis_client.get(cache_key)
+        except Exception:
+            cached_url = None
+
+        if cached_url is not None:
+            mapping = (
+                db.query(URLMapping)
+                .filter(URLMapping.short_code == short_code)
+                .first()
+            )
+            if mapping is None:
+                raise HTTPException(status_code=404, detail="Short URL not found")
+
+            mapping.click_count += 1
+            db.commit()
+            return RedirectResponse(url=cached_url, status_code=307)
+
         mapping = (
             db.query(URLMapping)
             .filter(URLMapping.short_code == short_code)
@@ -92,6 +111,11 @@ def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> Redi
         )
         if mapping is None:
             raise HTTPException(status_code=404, detail="Short URL not found")
+
+        try:
+            redis_client.set(cache_key, mapping.original_url, ex=3600)
+        except Exception:
+            pass
 
         mapping.click_count += 1
         db.commit()
