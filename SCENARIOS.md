@@ -146,6 +146,58 @@ grows."
 - sqlite_master showed a unique index on short_code.
 - All 7 tests continued to pass.
 
+**Concrete Verification:**
+
+**Prompt used:**
+> "Does URLMapping.short_code currently have an index? If not, add
+> index=True. Do not change anything else."
+
+**Introspection (in the Python REPL):**
+
+```python
+>>> from models import URLMapping
+>>> URLMapping.short_code.index
+True
+>>> URLMapping.short_code.unique
+True
+>>> URLMapping.short_code.nullable
+False
+
+Database-level verification:
+
+>>> import sqlite3
+>>> conn = sqlite3.connect('shortener.db')
+>>> conn.execute(
+...     "SELECT name FROM sqlite_master WHERE type='index'"
+... ).fetchall()
+[('ix_url_mappings_short_code',), ('sqlite_autoindex_url_mappings_1',)]
+
+Interpretation:
+ix_url_mappings_short_code is the explicit index added via index=True.
+
+sqlite_autoindex_url_mappings_1 is the implicit index SQLite creates
+to enforce the unique=True constraint.
+
+Both confirm the lookup path is indexed at the database level, not
+just declared in the ORM model.
+
+Conclusion: The ambiguous "make it scale" requirement was
+normalized into a specific, verifiable engineering question — "is
+short-code lookup indexed?" — and answered with concrete evidence
+from both the model and the database.
+
+**Save.**
+
+---
+
+### Step 3: Commit
+
+```powershell
+git add ENGINEERING_SUMMARY.md SCENARIOS.md
+git commit -m "Add validation evidence table and concrete scale verification"
+git log --oneline
+git status
+
 ### Outcome
 
 This ambiguity was already resolved during the greenfield build —

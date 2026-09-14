@@ -65,6 +65,65 @@ Behavioral:
 Final state: 7 passed, 2 warnings in ~1.7s. The two remaining
 warnings are upstream (Starlette/httpx, anyio) and not project code.
 
+## 3a. Performance and Scale Notes
+
+The assignment calls for a "scalable" service. This section states
+clearly what was measured and what was not.
+
+**What is designed for scale:**
+- Indexed `short_code` column for O(log n) lookups
+- Unique constraint preventing duplicates at the DB layer
+- Idempotent `POST /shorten` preventing unbounded duplicate rows
+- Stateless FastAPI handlers suitable for horizontal scaling
+- `secrets`-based uniform code distribution to avoid hot spots
+
+**What is not measured:**
+- No load test, benchmark, or throughput measurement was performed.
+- No latency targets were verified against the running service.
+
+**Why:**
+Time was allocated to correctness, validation, and documentation
+based on the assignment's emphasis on engineering execution under
+AI assistance, rather than performance engineering.
+
+**What would be measured if this were productionized:**
+- P99 latency for both POST /shorten and GET /{short_code}
+- Sustained RPS per instance
+- Error rate under load
+- Collision retry rate
+
+See `ARCHITECTURE.md` §9 for details.
+
+**Honest limitation:** A reviewer looking for empirical scalability
+evidence will not find it here. The scale-relevant design is
+documented and defensible; the measurements are not claimed.
+
+### 3b. Validation Evidence
+
+Every claim in this summary is backed by a specific observation from
+running the code. Evidence is listed here so a reviewer can verify
+each claim independently.
+
+| Claim | How It Was Verified | Observed Result |
+|-------|---------------------|-----------------|
+| Test suite passes | `python -m pytest tests/ -v` | `7 passed, 2 warnings in ~1.5s` |
+| Database table created | `Base.metadata.create_all()` at startup; `sqlite_master` query | `[('url_mappings',)]` |
+| Index on `short_code` | Introspection: `URLMapping.short_code.index` | `True` |
+| Unique constraint | Introspection: `URLMapping.short_code.unique` | `True` |
+| Not nullable | Introspection: `URLMapping.short_code.nullable` | `False` |
+| URL validation rejects bad input | `POST /shorten` with `{"original_url": "notaurl"}` | `422` with `"must start with http:// or https://"` |
+| Idempotent creation | `POST /shorten` twice with same URL | Same `short_code` both times |
+| Redirect works | Server log during manual test | `"GET /u7o6u1 HTTP/1.1" 307` |
+| Analytics increments | `GET /analytics/{code}` after one redirect | `click_count: 1` |
+| 404 for unknown code | `GET /zzzzzz` | `404` with `{"detail": "Short URL not found"}` |
+| Redirect counter increments per request | Two requests → analytics check | `click_count: 2` |
+| OpenAPI metadata documents 307/404 | `/docs` after `responses=` addition | Swagger UI shows both status codes |
+
+**Note on the redirect via Swagger:** Swagger's "Execute" button
+triggers a CORS block when the endpoint returns a 307 to an external
+domain. The 307 is verified via the browser address bar and `curl -I`
+instead. This is documented in `README.md`.
+
 ## 4. Risks and Mitigation
 
 | Risk | Category | Mitigation |
