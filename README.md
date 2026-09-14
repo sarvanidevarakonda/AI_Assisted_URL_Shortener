@@ -14,7 +14,9 @@ ownership of design, validation, and code quality.
 - `GET /{short_code}` redirects (307) to the original URL and increments click count
 - `GET /analytics/{short_code}` returns click count and metadata
 - Input validation via Pydantic (rejects non-http/https URLs)
-- Full pytest suite with per-test database isolation
+- Redis-backed read-through cache on the redirect path (fail-open)
+- Benchmark: Redis cache hits ~3.7× faster than SQLite lookups
+- Full pytest suite (10 tests) with per-test database isolation
 
 ## Tech Stack
 
@@ -46,7 +48,7 @@ AI_Assisted_URL_Shortener/
 ├── requirements.txt
 ├── tests/
 │   ├── __init__.py
-│   └── test_main.py              # 7 endpoint tests
+│   └── test_main.py              # 10 endpoint tests
 └── shortener.db                  # SQLite DB (gitignored, created on first run)
 
 ## Setup
@@ -103,7 +105,7 @@ Run this command in the project root:
 
     python -m pytest tests/ -v
 
-Expected: `7 passed, 2 warnings`. The two warnings are upstream
+Expected: `10 passed, 2 warnings`. The two warnings are upstream
 (Starlette/httpx, anyio) and not project code.
 
 ### Step 2: Start the server
@@ -150,7 +152,7 @@ Expect `{"detail": "Short URL not found"}`.
 
 | Step | Expected Result |
 |------|-----------------|
-| Run tests | 7 passed |
+| Run tests | 10 passed |
 | Create short URL | 200 with `short_code` |
 | Same URL again | Same `short_code` (idempotent) |
 | Redirect | 307 → original URL |
@@ -233,7 +235,7 @@ Expected result:
     tests/test_main.py::test_analytics_increments PASSED
     tests/test_main.py::test_analytics_invalid_code PASSED
 
-    7 passed, 2 warnings
+    10 passed, 2 warnings
 
 Note: Use python -m pytest (not bare pytest) so the project root
 is added to sys.path and main.py is importable from the test module.
