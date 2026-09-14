@@ -83,12 +83,19 @@ def shorten_url(request: URLRequest, db: Session = Depends(get_db)) -> URLRespon
     },
 )
 def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> RedirectResponse:
-    """Redirect to the original URL and increment its click count."""
+    """Redirect to the original URL and increment its click count.
+
+    Uses Redis as a read-through cache for the short_code -> original_url
+    mapping. Redis is treated as fail-open: any Redis error falls through
+    to the database path so redirects keep working if the cache is down.
+    """
     try:
         cache_key = f"url:{short_code}"
+
         try:
             cached_url = redis_client.get(cache_key)
         except Exception:
+            # Fail-open: any Redis problem should not break redirects
             cached_url = None
 
         if cached_url is not None:
@@ -115,6 +122,7 @@ def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> Redi
         try:
             redis_client.set(cache_key, mapping.original_url, ex=3600)
         except Exception:
+            # Fail-open: cache write failures are non-fatal
             pass
 
         mapping.click_count += 1

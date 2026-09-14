@@ -7,6 +7,25 @@ import main
 from database import Base, get_db
 
 
+class FakeRedis:
+    """In-memory stub for redis_client.
+
+    By default, behaves like a cold cache (all gets miss).
+    Pass `preload={key: value}` to simulate cache hits.
+    """
+
+    def __init__(self, preload=None):
+        self.store = dict(preload or {})
+        self.set_calls = []
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def set(self, key, value, ex=None):
+        self.store[key] = value
+        self.set_calls.append((key, value, ex))
+
+
 @pytest.fixture
 def test_database(tmp_path):
     """Create an isolated SQLite database for one test."""
@@ -37,11 +56,21 @@ def test_database(tmp_path):
 
 
 @pytest.fixture
-def client(test_database):
-    """Provide a TestClient backed by the isolated test database."""
+def fake_redis(monkeypatch):
+    """Replace main.redis_client with an in-memory stub for every test."""
+    stub = FakeRedis()
+    monkeypatch.setattr(main, "redis_client", stub)
+    return stub
+
+
+@pytest.fixture
+def client(test_database, fake_redis):
+    """Provide a TestClient backed by the isolated test database and fake cache."""
     with TestClient(main.app) as test_client:
         yield test_client
 
+
+# ---------- POST /shorten ----------
 
 def test_shorten_valid_url(client):
     response = client.post("/shorten", json={"original_url": "https://example.com"})
@@ -70,6 +99,8 @@ def test_shorten_invalid_url(client):
     assert response.status_code == 422
 
 
+# ---------- GET /{short_code} ----------
+
 def test_redirect_valid_code(client):
     url = "https://example.com"
     shorten_response = client.post("/shorten", json={"original_url": url})
@@ -81,33 +112,74 @@ def test_redirect_valid_code(client):
     assert response.headers["location"] == url
 
 
-def test_redirect_cache_hit_uses_cached_url_and_increments_clicks(client, monkeypatch):
-    class FakeRedis:
-        def __init__(self):
-            self.set_calls = []
+def test_redirect_cache_hit_uses_cached_url_and_increments_clicks(
+    test_database, monkeypatch
+):
+    """Cache hit returns the cached URL without querying Redis.set again."""
+    # Build a client whose Redis is preloaded with a cache hit
+    preloaded = FakeRedis(preload={"url:cached-code": "https://cached.example.com"})
+    monkeypatch.setattr(main, "redis_client", preloaded)
 
+    with TestClient(main.app) as client:
+        # Create a DB row so the click-count update works
+        response = client.post(
+            "/shorten", json={"original_url": "https://example.com"}
+        )
+        short_code = response.json()["short_code"]
+
+        # Force the cache key to match the preloaded one
+        preloaded.store[f"url:{short_code}"] = "https://cached.example.com"
+
+        redirect_response = client.get(
+            f"/{short_code}", follow_redirects=False
+        )
+        analytics_response = client.get(f"/analytics/{short_code}")
+
+    assert redirect_response.status_code == 307
+    assert redirect_response.headers["location"] == "https://cached.example.com"
+    assert analytics_response.json()["click_count"] == 1
+    # Cache hit should NOT have triggered a new set() call
+    assert preloaded.set_calls == []
+
+
+def test_redirect_cache_miss_populates_cache(client, fake_redis):
+    """First lookup populates the cache; second lookup uses it."""
+    url = "https://example.com"
+    shorten_response = client.post("/shorten", json={"original_url": url})
+    short_code = shorten_response.json()["short_code"]
+
+    assert fake_redis.get(f"url:{short_code}") is None  # cold cache
+
+    first = client.get(f"/{short_code}", follow_redirects=False)
+    assert first.status_code == 307
+    assert fake_redis.get(f"url:{short_code}") == url  # cache populated
+    assert len(fake_redis.set_calls) == 1
+
+    second = client.get(f"/{short_code}", follow_redirects=False)
+    assert second.status_code == 307
+    assert len(fake_redis.set_calls) == 1  # no second set on hit
+
+
+def test_redirect_fails_open_when_redis_is_down(client, monkeypatch):
+    """If Redis raises on get(), the DB path still serves the redirect."""
+
+    class BrokenRedis:
         def get(self, key):
-            assert key.startswith("url:")
-            return "https://cached.example.com"
+            raise ConnectionError("Redis is down")
 
         def set(self, *args, **kwargs):
-            self.set_calls.append((args, kwargs))
+            raise ConnectionError("Redis is down")
 
-    fake_redis = FakeRedis()
-    monkeypatch.setattr(main, "redis_client", fake_redis)
+    monkeypatch.setattr(main, "redis_client", BrokenRedis())
 
-    shorten_response = client.post(
-        "/shorten", json={"original_url": "https://example.com"}
-    )
+    url = "https://example.com"
+    shorten_response = client.post("/shorten", json={"original_url": url})
     short_code = shorten_response.json()["short_code"]
 
     response = client.get(f"/{short_code}", follow_redirects=False)
-    analytics_response = client.get(f"/analytics/{short_code}")
 
     assert response.status_code == 307
-    assert response.headers["location"] == "https://cached.example.com"
-    assert analytics_response.json()["click_count"] == 1
-    assert fake_redis.set_calls == []
+    assert response.headers["location"] == url
 
 
 def test_redirect_invalid_code(client):
@@ -115,6 +187,8 @@ def test_redirect_invalid_code(client):
 
     assert response.status_code == 404
 
+
+# ---------- GET /analytics/{short_code} ----------
 
 def test_analytics_increments(client):
     shorten_response = client.post(
