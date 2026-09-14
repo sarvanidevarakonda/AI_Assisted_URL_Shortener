@@ -31,7 +31,14 @@ def _build_url_response(mapping: URLMapping) -> URLResponse:
     )
 
 
-@app.post("/shorten", response_model=URLResponse)
+@app.post(
+    "/shorten",
+    response_model=URLResponse,
+    responses={
+        422: {"description": "Invalid URL format"},
+        500: {"description": "Database error or unable to generate a unique code"},
+    },
+)
 def shorten_url(request: URLRequest, db: Session = Depends(get_db)) -> URLResponse:
     """Create a short URL or return the existing mapping for the original URL."""
     try:
@@ -68,7 +75,13 @@ def shorten_url(request: URLRequest, db: Session = Depends(get_db)) -> URLRespon
         raise HTTPException(status_code=500, detail="Database error") from exc
 
 
-@app.get("/{short_code}")
+@app.get(
+    "/{short_code}",
+    responses={
+        307: {"description": "Redirect to the original URL"},
+        404: {"description": "Short URL not found"},
+    },
+)
 def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> RedirectResponse:
     """Redirect to the original URL and increment its click count."""
     try:
@@ -90,7 +103,13 @@ def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> Redi
         raise HTTPException(status_code=500, detail="Database error") from exc
 
 
-@app.get("/analytics/{short_code}", response_model=AnalyticsResponse)
+@app.get(
+    "/analytics/{short_code}",
+    response_model=AnalyticsResponse,
+    responses={
+        404: {"description": "Short URL not found"},
+    },
+)
 def get_analytics(short_code: str, db: Session = Depends(get_db)) -> AnalyticsResponse:
     """Return analytics for a shortened URL."""
     try:

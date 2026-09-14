@@ -190,6 +190,13 @@ For each component:
   upstream library issues, not project code. Documented as known
   limitations rather than fixed, to avoid patching third-party packages.
 
+  **Post-review polish:**
+- Swagger UI labeled 307/404 responses as "Undocumented" because
+  the route decorators didn't declare them in OpenAPI `responses=`.
+- Added `responses={307: ..., 404: ...}` metadata to `GET /{short_code}`,
+  and corresponding entries for `/shorten` and `/analytics/{short_code}`.
+- Verified: /docs now shows the responses; all 7 tests still pass.
+
 ---
 
 ## Component: `tests/test_main.py`
