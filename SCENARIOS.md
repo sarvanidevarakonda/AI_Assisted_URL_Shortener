@@ -44,7 +44,7 @@ validation.
 | 4 | Manual curl: 200 + short_code; duplicate URL returned same code |
 | 5 | Manual curl -I: 307 + correct location header |
 | 6 | Manual curl: click_count incremented after redirect |
-| 7 | python -m pytest tests/ -v -> 7 passed |
+| 7 | python -m pytest tests/ -v -> 10 passed |
 | 8 | Warning count dropped from 4 -> 2 (remaining are upstream) |
 
 ### Engineer Corrections to AI Output
@@ -93,7 +93,7 @@ After:
     7 passed, 2 warnings in 1.70s
       (only .venv\Lib\site-packages\... warnings remain)
 
-- Behavior unchanged: all 7 tests still pass.
+- Behavior unchanged: all 10 tests still pass.
 - Warning from project code eliminated.
 - Remaining warnings traced to site-packages, not project files.
 
@@ -144,7 +144,7 @@ grows."
 
 - URLMapping.short_code.index returned True.
 - sqlite_master showed a unique index on short_code.
-- All 7 tests continued to pass.
+- All 10 tests continued to pass.
 
 **Concrete Verification:**
 
