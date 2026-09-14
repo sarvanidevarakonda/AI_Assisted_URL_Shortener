@@ -93,6 +93,82 @@ available at http://localhost:8000/docs.
 The SQLite file shortener.db and the url_mappings table are created
 automatically on first startup via the FastAPI lifespan handler.
 
+## Quick Verification (5 Minutes)
+
+If you want to verify the service works end-to-end quickly, follow these steps.
+
+### Step 1: Run the tests
+
+Run this command in the project root:
+
+    python -m pytest tests/ -v
+
+Expected: `7 passed, 2 warnings`. The two warnings are upstream
+(Starlette/httpx, anyio) and not project code.
+
+### Step 2: Start the server
+
+    fastapi dev main.py
+
+Server listens on `http://localhost:8000`.
+
+### Step 3: Verify each endpoint
+
+**a) Create a short URL** — open `http://localhost:8000/docs`,
+expand `POST /shorten`, click "Try it out", and send:
+
+    { "original_url": "https://www.wikipedia.org" }
+
+Copy the `short_code` from the response.
+
+**b) Test idempotency** — execute the same request again. The same
+`short_code` should be returned.
+
+**c) Test redirect** — paste this into your browser's address bar
+(replace `YOUR_CODE`):
+
+    http://localhost:8000/YOUR_CODE
+
+You should land on `https://www.wikipedia.org`.
+
+**d) Test analytics** — in your browser:
+
+    http://localhost:8000/analytics/YOUR_CODE
+
+Expect `click_count: 1`.
+
+**e) Test validation** — in Swagger, send `{"original_url": "notaurl"}`.
+Expect `422` with a message about needing `http://` or `https://`.
+
+**f) Test 404** — in your browser:
+
+    http://localhost:8000/zzzzzz
+
+Expect `{"detail": "Short URL not found"}`.
+
+### Verification Summary
+
+| Step | Expected Result |
+|------|-----------------|
+| Run tests | 7 passed |
+| Create short URL | 200 with `short_code` |
+| Same URL again | Same `short_code` (idempotent) |
+| Redirect | 307 → original URL |
+| Analytics | `click_count` ≥ 1 |
+| Invalid URL | 422 |
+| Unknown code | 404 |
+
+**Note:** Do not test the redirect via Swagger's "Execute" button.
+Swagger sends an `Accept: application/json` header and the browser
+blocks cross-origin redirects, causing a false "Failed to fetch."
+Test redirects in a browser address bar or with `curl -I` instead.
+
+## API Documentation Preview
+
+![Swagger UI showing the three endpoints](Verification_Image.png)
+
+The interactive API docs are available at `/docs` when the server is running.
+
 ## API Reference
 
 ### POST /shorten
