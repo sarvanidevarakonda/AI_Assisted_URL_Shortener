@@ -1,4 +1,4 @@
-# AI Assistance Log
+﻿# AI Assistance Log
 
 **Project:** AI-Assisted URL Shortener Service  
 **Candidate:** Sarvani Devarakonda  
@@ -184,7 +184,7 @@ For each component:
 - Prompted Copilot to refactor to `@asynccontextmanager` with
   `Base.metadata.create_all(bind=engine)` before `yield`, passed to
   `FastAPI(lifespan=lifespan)`.
-- Verified: 7 tests still pass; the `main.py:17` deprecation warning
+- Verified: 10 tests still pass; the `main.py:17` deprecation warning
   no longer appears in pytest output (warnings dropped from 4 to 2).
 - Remaining warnings (Starlette/httpx, anyio.BlockingPortal) are
   upstream library issues, not project code. Documented as known
@@ -195,7 +195,7 @@ For each component:
   the route decorators didn't declare them in OpenAPI `responses=`.
 - Added `responses={307: ..., 404: ...}` metadata to `GET /{short_code}`,
   and corresponding entries for `/shorten` and `/analytics/{short_code}`.
-- Verified: /docs now shows the responses; all 7 tests still pass.
+- Verified: /docs now shows the responses; all 10 tests still pass.
 
 ---
 
