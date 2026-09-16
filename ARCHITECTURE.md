@@ -201,10 +201,14 @@ Both used the same short code against the same dataset.
 
 | Metric | SQLite | Redis (Memurai) | Speedup |
 |--------|--------|-----------------|---------|
-| Average | 0.451 ms | 0.122 ms | 3.7x |
-| Median | 0.360 ms | 0.105 ms | 3.4x |
-| P99 | 1.261 ms | 0.282 ms | 4.5x |
-| Max | 1.912 ms | 0.471 ms | 4.1x |
+| Average | 0.36–0.45 ms | 0.12–0.17 ms | 2.2–3.7× |
+| Median | 0.32–0.39 ms | 0.10–0.13 ms | 2.4–3.4× |
+| P99 | 0.90–1.26 ms | 0.28–0.56 ms | 1.8–4.5× |
+| Max | 1.88–2.19 ms | 0.47–1.06 ms | 2.1–4.1× |
+
+Ranges reflect two independent benchmark runs. Environment: Windows,
+Python 3.12, SQLite 3, Memurai (Redis-compatible, Redis 7 API), local
+loopback. Benchmark script: `benchmark.py`
 
 **Environment:** Windows, Python 3.12, SQLite 3, Memurai (Redis-compatible,
 Redis 7 API), local loopback. Benchmark script: `benchmark.py`.

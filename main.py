@@ -1,3 +1,25 @@
+import concurrent.futures
+
+
+_redis_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _redis_get_with_timeout(key: str, timeout: float = 1.0):
+    """Return cached value or None if Redis doesn't respond within timeout."""
+    try:
+        future = _redis_pool.submit(redis_client.get, key)
+        return future.result(timeout=timeout)
+    except (concurrent.futures.TimeoutError, Exception):
+        return None
+
+
+def _redis_set_with_timeout(key: str, value: str, ttl: int, timeout: float = 1.0) -> None:
+    """Write to cache, ignoring failures or timeouts."""
+    try:
+        future = _redis_pool.submit(redis_client.set, key, value, ex=ttl)
+        future.result(timeout=timeout)
+    except (concurrent.futures.TimeoutError, Exception):
+        pass
 import secrets
 import string
 from contextlib import asynccontextmanager
@@ -92,11 +114,7 @@ def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> Redi
     try:
         cache_key = f"url:{short_code}"
 
-        try:
-            cached_url = redis_client.get(cache_key)
-        except Exception:
-            # Fail-open: any Redis problem should not break redirects
-            cached_url = None
+        cached_url = _redis_get_with_timeout(cache_key, timeout=1.0)
 
         if cached_url is not None:
             mapping = (
@@ -119,11 +137,7 @@ def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> Redi
         if mapping is None:
             raise HTTPException(status_code=404, detail="Short URL not found")
 
-        try:
-            redis_client.set(cache_key, mapping.original_url, ex=3600)
-        except Exception:
-            # Fail-open: cache write failures are non-fatal
-            pass
+        _redis_set_with_timeout(cache_key, mapping.original_url, ttl=3600, timeout=1.0)
 
         mapping.click_count += 1
         db.commit()

@@ -15,7 +15,7 @@ ownership of design, validation, and code quality.
 - `GET /analytics/{short_code}` returns click count and metadata
 - Input validation via Pydantic (rejects non-http/https URLs)
 - Redis-backed read-through cache on the redirect path (fail-open)
-- Benchmark: Redis cache hits ~3.7× faster than SQLite lookups
+- Benchmark: Redis cache hits ~2.2× faster than SQLite lookups
 - Full pytest suite (10 tests) with per-test database isolation
 
 ## Tech Stack
@@ -231,10 +231,14 @@ Expected result:
     tests/test_main.py::test_shorten_idempotent PASSED
     tests/test_main.py::test_shorten_invalid_url PASSED
     tests/test_main.py::test_redirect_valid_code PASSED
+    tests/test_mainpy::test_redirect_cache_hit_uses_cached_url_and_increments_clicks PASSED
+    tests/test_main.py::test_redirect_cache_miss_populates_cache PASSED
+    tests/test_main.py::test_redirect_fails_open_when_redis_is_down PASSED
     tests/test_main.py::test_redirect_invalid_code PASSED
     tests/test_main.py::test_analytics_increments PASSED
     tests/test_main.py::test_analytics_invalid_code PASSED
 
+    
     10 passed, 2 warnings
 
 Note: Use python -m pytest (not bare pytest) so the project root
