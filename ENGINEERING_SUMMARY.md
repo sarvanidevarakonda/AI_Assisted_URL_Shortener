@@ -10,20 +10,23 @@
 ## 1. Implementation Approach and Rationale
 
 I built a URL shortener with three HTTP endpoints (`POST /shorten`,
-`GET /{short_code}`, `GET /analytics/{short_code}`) using FastAPI,
-SQLAlchemy, SQLite, and a Redis-compatible cache layer. The design
-deliberately kept each concern in its own module:
+`GET /{short_code}`, `GET /analytics/{short_code}`) plus `/health` and
+`/ready` probes, using FastAPI, SQLAlchemy, SQLite, and a Redis-compatible
+cache and queue layer. The design deliberately kept each concern in its
+own module:
 
 - `database.py` — engine, session lifecycle, and Redis client
 - `models.py` — persistent entity
 - `schemas.py` — request/response contracts
-- `main.py` — routing, caching, and orchestration
-- `benchmark.py` — Redis vs SQLite lookup latency comparison
+- `main.py` — routing, caching, queue-based click tracking, and a
+  background flush worker
+- `benchmark.py` — three-path latency comparison
 
 GitHub Copilot (Agent Mode) generated the first draft of each module. I
 then reviewed every line, corrected deprecated APIs, added missing
-constraints, added the caching layer, and validated behavior with a
-10-test pytest suite that uses per-test database isolation.
+constraints, redesigned the caching layer to eliminate the DB write
+from the hot path, and validated behavior with an 11-test pytest suite
+that uses per-test database isolation.
 
 The intent was not to maximize AI output — it was to demonstrate that
 AI accelerates *while the engineer retains ownership*. That ownership
@@ -37,9 +40,10 @@ component, what Copilot produced, and what I changed.
 | `database.py` | SQLAlchemy engine, `SessionLocal`, `Base`, `get_db()`, `redis_client` |
 | `models.py` | `URLMapping` table with indexed, unique `short_code` |
 | `schemas.py` | Pydantic v2 models with URL validation |
-| `main.py` | FastAPI app with lifespan handler, 3 endpoints, Redis-cached redirect, fail-open timeout wrapper |
-| `benchmark.py` | Redis vs SQLite lookup latency benchmark |
-| `tests/test_main.py` | 10 endpoint tests with temp DB per test |
+| `main.py` | FastAPI app with lifespan handler, 5 endpoints, queue-based click tracking, background flush worker, fail-open timeout wrapper |
+| `ClickFlushWorker` (in `main.py`) | Background thread; drains the Redis click queue into SQLite every 5s |
+| `benchmark.py` | Three-path latency comparison (DB-only, cache+DB, cache+queue) |
+| `tests/test_main.py` | 11 endpoint tests with temp DB per test |
 | `AI_LOG.md` | Per-file prompt/output/validation record |
 | `ARCHITECTURE.md` | System design, cache model, AI integration, trade-offs |
 | `SCENARIOS.md` | Greenfield / brownfield / ambiguous walkthroughs |
@@ -62,13 +66,14 @@ Three layers of validation:
 - Redis client verified via `SET`/`GET` smoke test
 
 **Behavioral**
-- 10 pytest cases covering valid/invalid input, idempotency, redirect
+- 11 pytest cases covering valid/invalid input, idempotency, redirect
   status + location, cache hit path, cache miss path, fail-open on
-  Redis outage, analytics increment, and 404 paths
+  Redis outage, analytics increment, 404 paths, and **20 concurrent
+  redirects producing exactly 20 clicks** after queue flush
 - Manual curl tests during development
-- Benchmark: 1,000 iterations per backend
+- Benchmark: 1,000 iterations per scenario across three handler paths
 
-Final state: **10 passed, 2 warnings** in ~1.5s. The two remaining
+Final state: **11 passed, 2 warnings** in ~24s. The two remaining
 warnings are upstream (Starlette/httpx, anyio) and not project code.
 
 ## 3a. Performance and Scale Notes
@@ -82,31 +87,43 @@ clearly what was measured and what was not.
 - Idempotent `POST /shorten` preventing unbounded duplicate rows
 - Stateless FastAPI handlers suitable for horizontal scaling
 - `secrets`-based uniform code distribution to avoid hot spots
-- Redis cache layer removing DB hits for hot codes
-- Thread-pool-bounded Redis timeout so fail-open latency is fixed at
-  ~1 second regardless of OS socket behavior
+- Redis cache removing the URL-lookup DB hit for hot codes
+- **Queue-based click tracking** removing the click-write DB hit
+  from the hot path entirely
+- **Batched atomic UPDATEs** — the worker flushes many clicks in one
+  transaction, so the DB sees far fewer writes under load
+- Thread-pool timeout wrapping every Redis call, so fail-open latency
+  is bounded at ~1s regardless of OS socket behavior
 
 **What is measured:**
-- Redis cache hits average **0.12–0.17 ms** vs SQLite lookups at
-  **0.36–0.45 ms** — a **2.2–3.7× speedup** per lookup (1,000
-  iterations each, local loopback, across two runs).
-- P99 latency improves from **0.90–1.26 ms** (SQLite) to
-  **0.28–0.56 ms** (Redis) — up to **4.5× improvement at the tail**,
-  which matters most under load.
+- Benchmark of three handler paths (1,000 iterations each, `benchmark.py`):
+  1. DB-only (pre-cache): `SELECT` + `UPDATE` → **8.07 ms avg**
+  2. Cache + DB write: Redis `GET` + `UPDATE` → **7.74 ms avg**
+  3. **Cache + queue (hot path): Redis `GET` + `RPUSH` → 0.29 ms avg**
+- **Hot-path speedup vs pre-cache: 27.6×.**
+- Cache-only design (option 2) gave only ~4% improvement because the
+  DB write dominated. Moving clicks to a queue removed the write
+  entirely — that is where the real gain comes from.
+- Concurrent-click correctness: 20 parallel redirects → final count
+  is exactly 20 after queue flush (verified in
+  `test_concurrent_clicks_are_counted_correctly`).
 - Fail-open behavior with Redis down completes in **~1–2 seconds**,
-  bounded by a `ThreadPoolExecutor` future timeout of 1s (verified
-  manually by stopping the Memurai service).
-- Benchmark script: `benchmark.py`. Full results in `ARCHITECTURE.md` §9.
+  bounded by a `ThreadPoolExecutor` future timeout of 1s.
+
+**Honest caveat:** `click_count` in the database lags by up to the
+5-second worker interval. The analytics endpoint compensates by adding
+the pending queue depth, so the user-visible count is always accurate.
 
 **What is not measured:**
 - HTTP-layer load testing (concurrent clients, sustained RPS).
 - Multi-region latency.
-- Behavior under cache eviction / cold-start conditions at high churn.
+- Behavior under cache eviction / cold-start at high churn.
+- Worker scaling under high queue depth.
 
 **Why this scope:**
-The backend lookup is the dominant cost on the redirect path. Measuring
-it directly yields actionable evidence for the caching decision without
-requiring the infrastructure needed for HTTP load testing. Load
+The handler path is the dominant cost on the redirect. Measuring it
+directly yields actionable evidence for the caching and queue design
+without requiring the infrastructure for HTTP load testing. Load
 testing is listed as a productionization step in `ARCHITECTURE.md` §10.
 
 ## 3b. Validation Evidence
@@ -117,7 +134,7 @@ each claim independently.
 
 | Claim | How It Was Verified | Observed Result |
 |-------|---------------------|-----------------|
-| Test suite passes | `python -m pytest tests/ -v` | `10 passed, 2 warnings in ~1.5s` |
+| Test suite passes | `python -m pytest tests/ -v` | `11 passed, 2 warnings in ~24s` |
 | Database table created | `Base.metadata.create_all()` at startup; `sqlite_master` query | `[('url_mappings',)]` |
 | Index on `short_code` | Introspection: `URLMapping.short_code.index` | `True` |
 | Unique constraint | Introspection: `URLMapping.short_code.unique` | `True` |
@@ -128,13 +145,14 @@ each claim independently.
 | Analytics increments | `GET /analytics/{code}` after one redirect | `click_count` incremented |
 | 404 for unknown code | `GET /zzzzzz` | `404` with `{"detail": "Short URL not found"}` |
 | OpenAPI metadata documents 307/404 | `/docs` after `responses=` addition | Swagger UI shows both status codes |
-| Redis cache populates on redirect | `redis_client.get('url:{code}')` after a redirect | Original URL stored |
-| Redis cache reduces latency | `python benchmark.py`, 1,000 iterations per backend | Redis ~0.12–0.17 ms avg vs SQLite ~0.36–0.45 ms avg (2.2–3.7× speedup) |
-| TTL applied | `redis_client.ttl('url:{code}')` | Positive value (< 3600) |
-| Cache-hit test passes | `test_redirect_cache_hit_uses_cached_url_and_increments_clicks` | PASSED |
-| Cache-miss test passes | `test_redirect_cache_miss_populates_cache` | PASSED |
+| Redis URL cache populates on miss | `redis_client.get('url:{code}')` after a redirect | Original URL stored |
+| Cache hit doesn't call Redis SET | `test_redirect_cache_hit_uses_cached_url_and_increments_clicks` | PASSED — `set_calls == []` |
+| TTL applied to URL cache | `redis_client.ttl('url:{code}')` | Positive value < 3600 |
+| Cache-hit click is queued, not written | `test_redirect_cache_hit_uses_cached_url_and_increments_clicks` | PASSED — analytics reads queue depth |
+| **20 concurrent clicks → exact count** | `test_concurrent_clicks_are_counted_correctly` | PASSED — count == 20 after flush |
 | Fail-open works (mocked) | `test_redirect_fails_open_when_redis_is_down` | PASSED |
-| Fail-open works (real outage) | Stopped Memurai service, hit redirect URL | Redirect succeeded within ~1–2 seconds |
+| Fail-open works (real outage) | Stopped Memurai, hit redirect URL | Redirect succeeded in ~1–2 s |
+| **Hot-path speedup** | `python benchmark.py` | 0.29 ms vs 8.07 ms = **27.6×** |
 
 **Note on the redirect via Swagger:** Swagger's "Execute" button
 triggers a CORS block when the endpoint returns a 307 to an external
@@ -154,10 +172,13 @@ instead. This is documented in `README.md`.
 | Deprecated `@app.on_event` | Maintainability | Refactored to `@asynccontextmanager` lifespan |
 | Test DB contamination | Test isolation | Dependency override with temp SQLite |
 | pytest import failure | Build | Use `python -m pytest` (adds repo root to path) |
-| Redis unavailable | Availability | Fail-open: fall through to DB path |
-| Stale cache entries | Consistency | 1-hour TTL; acceptable for URL shorteners |
-| Redis socket hang on Windows | Availability | Thread-pool timeout wraps every Redis call at 1s |
+| Redis unavailable | Availability | Fail-open: fall through to atomic DB increment |
+| Stale URL cache | Consistency | 1-hour TTL; short codes are immutable |
+| Redis socket hang on Windows | Availability | Thread-pool future timeout wraps every Redis call at 1s |
+| Worker flush failure | Data integrity | Popped items re-queued so no click is lost |
+| Worker targets wrong DB in tests | Test correctness | `ClickFlushWorker(session_factory=...)` injection |
 | Copilot runtime misdiagnosis | AI-related | Cross-check every "not installed" claim in the active venv |
+| Copilot scaffolding not wired in | AI-related | Verify generated helpers are actually called; read the diff |
 
 ## 5. AI-Related Risks Observed
 
@@ -202,6 +223,9 @@ cannot be delegated to the AI.
 - The fail-open wrapper uses a small thread pool (`max_workers=4`); at
   very high concurrency with Redis down, requests could queue. For
   production, an async Redis client would be preferred.
+- `click_count` in the database lags by up to the 5-second worker
+  interval; the analytics endpoint corrects for this by adding the
+  pending queue depth.
 - HTTP-layer load testing (concurrent clients, sustained RPS) not
   performed. Backend lookup latency is benchmarked; see §3a.
 - Two upstream deprecation warnings remain (Starlette/httpx, anyio).
@@ -212,11 +236,11 @@ Against the assignment's own success criteria:
 
 | Criterion | Evidence |
 |-----------|----------|
-| Effective use of AI tools | `AI_LOG.md` — prompt, output, and review per file |
-| Strength of software design | Layered modules, indexed model, Pydantic validation, cache layer |
-| Quality and correctness | 10/10 tests pass; manual curl verified; benchmark recorded |
-| Demonstrated ownership | Every AI output reviewed; deprecated APIs corrected; caching designed and tested; unwired helpers caught |
-| Validation rigor | Static + runtime + behavioral + benchmark documented |
+| Effective use of AI tools | `AI_LOG.md` — prompt, output, and review per file; specific rejection logged |
+| Strength of software design | Layered modules, indexed model, Pydantic validation, cache + queue design |
+| Quality and correctness | 11/11 tests pass; 20-way concurrent click test; manual curl verified; benchmark recorded |
+| Demonstrated ownership | Every AI output reviewed; deprecated APIs corrected; queue design engineer-directed; unwired helpers caught |
+| Validation rigor | Static + runtime + behavioral + benchmark + concurrency documented |
 | Clarity and defensibility | Four docs + log; every choice has a rationale |
 | Controlled autonomy | Engineer-led decomposition; AI execution per task |
 
@@ -226,15 +250,27 @@ Copilot was genuinely useful — it produced working scaffolds for each
 module in minutes, which let me spend more time on review and
 validation than on typing. But every meaningful decision (index
 placement, timezone-aware timestamps, lifespan refactor, test
-isolation, route ordering, cache TTL, fail-open timeout strategy) was
-made by the engineer, not the AI.
+isolation, route ordering, cache TTL, fail-open timeout strategy, and
+the queue-based click design) was made by the engineer, not the AI.
 
-The caching work is a good illustration: Copilot generated the first
-draft of the redirect handler with Redis, but the design decisions —
-key pattern, TTL length, fail-open strategy, and the thread-pool
-timeout wrapper to bound fail-open latency on Windows — were all
-engineer choices, validated with a benchmark, a new regression test,
-and a real-world outage test.
+The caching work is the clearest illustration. Copilot generated the
+first draft of the redirect handler with Redis, but the design
+decisions were mine:
+
+1. **Queue over synchronous write.** After reviewing the cache-hit
+   path, I noticed the cache wasn't actually saving a DB round-trip.
+   Benchmarking confirmed it: caching the URL alone gave ~4%
+   improvement. Moving clicks to a Redis queue removed the DB write
+   from the hot path entirely and produced a 27.6× speedup.
+2. **Thread-pool timeout for fail-open.** `socket_connect_timeout=1`
+   on Windows does not honor the timeout when the port is unreachable
+   — a real outage test showed 52-second redirects. Wrapping Redis
+   calls in a `ThreadPoolExecutor` with a Python-level deadline
+   bounded fail-open latency to ~1 second.
+3. **Worker session injection.** The background worker needed a
+   `session_factory` parameter so tests could point it at the isolated
+   test DB — otherwise it silently wrote to the production database
+   and the concurrency test returned 0.
 
 The log is the artifact I'd point to first: it records the exact
 prompts, the exact outputs, and the exact corrections — a paper trail
