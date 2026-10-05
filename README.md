@@ -254,6 +254,22 @@ override on get_db. The production shortener.db is never touched.
 The two remaining warnings originate from Starlette / httpx / anyio
 internals and are upstream, not project code. See ENGINEERING_SUMMARY.md
 for details.
+## Requirement-to-Engineering Workflow Tool
+
+The `workflow.py` CLI demonstrates how a software requirement is turned
+into a structured engineering plan. It is deliberately **engineer-led**:
+the tool produces structure, not decisions. Every section is reviewed
+by the engineer before use.
+
+### Usage
+
+```bash
+python workflow.py examples/url_shortener.txt
+python workflow.py examples/url_shortener.txt --out plan.md
+python workflow.py examples/brownfield_add_expiry.txt
+python workflow.py examples/ambiguous_scale.txt
+echo "Add user login with OAuth" | python workflow.py -
+python workflow.py --list
 
 ## Known Limitations
 

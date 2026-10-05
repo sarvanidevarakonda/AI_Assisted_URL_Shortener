@@ -1,0 +1,8 @@
+Build a scalable URL shortener service with APIs, persistence, and analytics.
+
+Acceptance criteria:
+- Accept a long URL via HTTP and return a short code
+- Redirect the short code to the original URL
+- Persist mappings durably
+- Track click analytics per short code
+- Handle read-heavy load on the redirect path

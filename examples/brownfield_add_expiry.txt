@@ -1,0 +1,8 @@
+Add link expiry to the existing URL shortener.
+
+Callers may optionally supply an expires_at timestamp on POST /shorten.
+Expired links must return 410 Gone on redirect, not 404.
+Existing endpoints and existing tests must keep working unchanged.
+
+This is a brownfield change: extend the current service without
+rewriting it.
