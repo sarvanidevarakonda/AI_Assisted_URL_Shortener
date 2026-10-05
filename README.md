@@ -1,5 +1,7 @@
 # AI-Assisted URL Shortener
 
+[![tests](https://github.com/sarvanidevarakonda/AI_Assisted_URL_Shortener/actions/workflows/tests.yml/badge.svg)](https://github.com/sarvanidevarakonda/AI_Assisted_URL_Shortener/actions/workflows/tests.yml)
+
 A production-style URL shortener service built as a demonstration of
 AI-assisted software engineering. The project shows how GitHub Copilot
 was used as a development accelerator while the engineer retained full
