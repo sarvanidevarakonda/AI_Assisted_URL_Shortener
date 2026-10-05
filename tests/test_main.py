@@ -147,6 +147,50 @@ def test_shorten_invalid_url(client):
     assert response.status_code == 422
 
 
+def test_shorten_rejects_url_without_host(client):
+    """'https://' alone has no host — must be rejected."""
+    response = client.post("/shorten", json={"original_url": "https://"})
+    assert response.status_code == 422
+
+
+def test_shorten_rejects_url_with_whitespace(client):
+    """'https://exa mple.com' has a space — must be rejected."""
+    response = client.post("/shorten", json={"original_url": "https://exa mple.com"})
+    assert response.status_code == 422
+
+
+def test_shorten_rejects_url_without_dot_in_host(client):
+    """'https://notadomain' has no dot and isn't localhost — must be rejected."""
+    response = client.post("/shorten", json={"original_url": "https://notadomain"})
+    assert response.status_code == 422
+
+
+def test_shorten_accepts_localhost(client):
+    """localhost is explicitly allowed for development."""
+    response = client.post(
+        "/shorten", json={"original_url": "http://localhost:8000/path"}
+    )
+    assert response.status_code == 200
+    assert "short_code" in response.json()
+
+
+def test_shorten_accepts_url_with_port_and_path(client):
+    """A full URL with port, path, query, and fragment should be accepted."""
+    url = "https://example.com:8443/a/b?x=1&y=2#frag"
+    response = client.post("/shorten", json={"original_url": url})
+    assert response.status_code == 200
+    assert response.json()["original_url"] == url
+
+
+def test_shorten_trims_leading_trailing_whitespace(client):
+    """Whitespace on the edges is trimmed, not rejected."""
+    response = client.post(
+        "/shorten", json={"original_url": "  https://example.com  "}
+    )
+    assert response.status_code == 200
+    assert response.json()["original_url"] == "https://example.com"
+
+
 # ---------- GET /{short_code} ----------
 
 def test_redirect_valid_code(client):
