@@ -1,6 +1,7 @@
 import redis
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
+from config import REDIS_DB, REDIS_HOST, REDIS_PORT
 
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./shortener.db"
@@ -19,13 +20,15 @@ Base = declarative_base()
 # Windows does not always honor socket timeouts when the port is
 # unreachable (TCP SYN retries can exceed the configured timeout).
 
+from config import REDIS_HOST, REDIS_PORT, REDIS_DB
+
 redis_client = redis.Redis(
-    host="localhost",
-    port=6379,
-    db=0,
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=REDIS_DB,
     decode_responses=True,
-    socket_connect_timeout=1,   # fail fast on connect
-    socket_timeout=1,           # fail fast on read/write
+    socket_connect_timeout=1,
+    socket_timeout=1,
 )
 
 

@@ -275,7 +275,10 @@ python workflow.py --list
 
 - SQLite used for simplicity; concurrent writes in production would
   require PostgreSQL or another server-grade DB.
-- Short URL base is hardcoded to http://localhost:8000.
+- Short URL base is configurable via the `BASE_URL` environment variable
+  (default: `http://localhost:8000`).
+- Other configurable values: `RATE_LIMIT_SHORTEN`, `REDIS_HOST`,
+  `REDIS_PORT`, `REDIS_DB`, `CACHE_TTL_SECONDS`. See `config.py`.
 - No authentication, rate limiting, or abuse protection.
 - Analytics limited to a total click count (no time-series, referrer, or
   geography data).
