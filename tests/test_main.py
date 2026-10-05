@@ -7,6 +7,26 @@ import main
 from database import Base, get_db
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Clear slowapi's in-memory state between tests.
+
+    Without this, rate-limit counters accumulate across the test session
+    and unrelated tests start failing with 429.
+    """
+    try:
+        from main import limiter
+        limiter.reset()
+    except (ImportError, AttributeError):
+        pass
+    yield
+    try:
+        from main import limiter
+        limiter.reset()
+    except (ImportError, AttributeError):
+        pass
+
+
 class FakeRedis:
     """In-memory stub for redis_client.
 
@@ -282,3 +302,16 @@ def test_concurrent_clicks_are_counted_correctly(client, test_database):
 
     analytics = client.get(f"/analytics/{short_code}").json()
     assert analytics["click_count"] == 20, f"Expected 20, got {analytics['click_count']}"
+
+
+# ---------- Rate limiting ----------
+
+def test_rate_limit_returns_429_after_quota(client):
+    """20 requests allowed per minute; the 21st returns 429."""
+    url_base = "https://example.com/rate-limit-test-"
+    statuses = []
+    for i in range(25):
+        r = client.post("/shorten", json={"original_url": f"{url_base}{i}"})
+        statuses.append(r.status_code)
+    assert 429 in statuses, f"Expected a 429, got {statuses}"
+    assert statuses.count(200) <= 20

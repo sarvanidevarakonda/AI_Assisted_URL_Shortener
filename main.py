@@ -1,12 +1,18 @@
 import concurrent.futures
+import json
+import logging
 import secrets
 import string
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -14,6 +20,38 @@ from sqlalchemy.orm import Session
 from database import Base, engine, get_db, redis_client
 from models import URLMapping
 from schemas import AnalyticsResponse, URLRequest, URLResponse
+
+
+# ---------- Structured logging ----------
+
+class JsonFormatter(logging.Formatter):
+    """Minimal structured logger - one JSON object per line."""
+
+    def format(self, record):
+        payload = {
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
+
+
+def _configure_logging() -> logging.Logger:
+    logger = logging.getLogger("url_shortener")
+    if logger.handlers:
+        return logger
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
+
+logger = _configure_logging()
 
 
 # ---------- Redis helpers with hard timeout ----------
@@ -75,9 +113,8 @@ class ClickFlushWorker:
             while not self._stop:
                 try:
                     self._flush_once()
-                except Exception:
-                    # Never let the worker die — just try again next tick.
-                    pass
+                except Exception as exc:
+                    logger.info(f"worker flush error: {exc}")
                 time.sleep(self.interval)
 
         self._thread = threading.Thread(target=run, daemon=True)
@@ -102,12 +139,10 @@ class ClickFlushWorker:
         if not popped:
             return
 
-        # Aggregate per short_code
         counts: dict[str, int] = {}
         for code in popped:
             counts[code] = counts.get(code, 0) + 1
 
-        # Apply all increments in one session
         db = self._session_factory()
         try:
             for code, inc in counts.items():
@@ -117,9 +152,11 @@ class ClickFlushWorker:
                     .values(click_count=URLMapping.click_count + inc)
                 )
             db.commit()
+            logger.info(
+                f"worker flushed clicks={len(popped)} codes={len(counts)}"
+            )
         except Exception:
             db.rollback()
-            # Re-queue the popped items on failure so no click is lost.
             for code in popped:
                 try:
                     redis_client.rpush(CLICK_QUEUE_KEY, code)
@@ -138,13 +175,22 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     worker = ClickFlushWorker()
     worker.start()
+    logger.info("app startup complete")
     try:
         yield
     finally:
         worker.stop()
+        logger.info("app shutdown complete")
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ---------- Rate limiting ----------
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ---------- Response helpers ----------
@@ -164,30 +210,38 @@ def _build_url_response(mapping: URLMapping) -> URLResponse:
     response_model=URLResponse,
     responses={
         422: {"description": "Invalid URL format"},
+        429: {"description": "Rate limit exceeded"},
         500: {"description": "Database error or unable to generate a unique code"},
     },
 )
-def shorten_url(request: URLRequest, db: Session = Depends(get_db)) -> URLResponse:
+@limiter.limit("20/minute")
+def shorten_url(
+    request: Request,
+    url_request: URLRequest,
+    db: Session = Depends(get_db),
+) -> URLResponse:
     """Create a short URL or return the existing mapping for the original URL."""
     try:
         existing_mapping = (
             db.query(URLMapping)
-            .filter(URLMapping.original_url == request.original_url)
+            .filter(URLMapping.original_url == url_request.original_url)
             .first()
         )
         if existing_mapping is not None:
+            logger.info(f"shorten existing code={existing_mapping.short_code}")
             return _build_url_response(existing_mapping)
 
         alphabet = string.ascii_letters + string.digits
         for _ in range(3):
             mapping = URLMapping(
-                original_url=request.original_url,
+                original_url=url_request.original_url,
                 short_code="".join(secrets.choice(alphabet) for _ in range(6)),
             )
             db.add(mapping)
             try:
                 db.commit()
                 db.refresh(mapping)
+                logger.info(f"shorten created code={mapping.short_code}")
                 return _build_url_response(mapping)
             except IntegrityError:
                 db.rollback()
@@ -200,6 +254,7 @@ def shorten_url(request: URLRequest, db: Session = Depends(get_db)) -> URLRespon
         raise
     except SQLAlchemyError as exc:
         db.rollback()
+        logger.info(f"shorten db_error: {exc}")
         raise HTTPException(status_code=500, detail="Database error") from exc
 
 
@@ -228,39 +283,40 @@ def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> Redi
         cached_url = _redis_get(cache_key, timeout=1.0)
 
         if cached_url is not None:
-            # Hot path: one Redis GET, one Redis rpush, no DB read.
             _redis_rpush(CLICK_QUEUE_KEY, short_code, timeout=1.0)
+            logger.info(f"redirect cache_hit code={short_code}")
             return RedirectResponse(url=cached_url, status_code=307)
 
-        # Cache miss path
         mapping = (
             db.query(URLMapping)
             .filter(URLMapping.short_code == short_code)
             .first()
         )
         if mapping is None:
+            logger.info(f"redirect not_found code={short_code}")
             raise HTTPException(status_code=404, detail="Short URL not found")
 
         _redis_set(cache_key, mapping.original_url, ttl=3600, timeout=1.0)
+        logger.info(f"redirect cache_miss code={short_code}")
 
-        # If Redis is available, enqueue the click; otherwise, increment in DB.
         rpush_ok = _redis_call_with_timeout(
             redis_client.rpush, CLICK_QUEUE_KEY, short_code, timeout=1.0
         )
         if rpush_ok is None:
-            # Redis down — fall back to atomic DB increment.
             db.execute(
                 update(URLMapping)
                 .where(URLMapping.short_code == short_code)
                 .values(click_count=URLMapping.click_count + 1)
             )
             db.commit()
+            logger.info(f"redirect redis_down_db_fallback code={short_code}")
 
         return RedirectResponse(url=mapping.original_url, status_code=307)
     except HTTPException:
         raise
     except SQLAlchemyError as exc:
         db.rollback()
+        logger.info(f"redirect db_error: {exc}")
         raise HTTPException(status_code=500, detail="Database error") from exc
 
 
@@ -287,11 +343,12 @@ def get_analytics(short_code: str, db: Session = Depends(get_db)) -> AnalyticsRe
         if mapping is None:
             raise HTTPException(status_code=404, detail="Short URL not found")
 
-        # Add pending clicks from the Redis queue that target this code.
         pending = _pending_clicks_for(short_code)
-
         response = AnalyticsResponse.model_validate(mapping)
         response.click_count = mapping.click_count + pending
+        logger.info(
+            f"analytics code={short_code} db={mapping.click_count} pending={pending}"
+        )
         return response
     except HTTPException:
         raise
@@ -327,7 +384,6 @@ def ready():
 
     try:
         db = SessionLocal()
-        # A trivial no-op select — validates the connection is live.
         db.execute(update(URLMapping).where(URLMapping.id == -1))
         db.close()
         db_ok = True
