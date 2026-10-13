@@ -1,10 +1,11 @@
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker
 
 import main
 from database import Base, get_db
+from models import URLMapping
 
 
 @pytest.fixture(autouse=True)
@@ -348,6 +349,89 @@ def test_concurrent_clicks_are_counted_correctly(client, test_database):
     assert analytics["click_count"] == 20, f"Expected 20, got {analytics['click_count']}"
 
 
+def test_simultaneous_duplicate_creation_returns_same_code(client, test_database):
+    """Fire 10 concurrent POST /shorten for the SAME URL.
+
+    The unique constraint on original_url (added in response to this
+    test) ensures only one row is created even under concurrent
+    requests that all miss the idempotent pre-check. All successful
+    responses must return the same short_code, and only one row must
+    exist in the DB.
+    """
+    import concurrent.futures
+
+    url = "https://example.com/duplicate-race"
+    codes = []
+
+    def create():
+        r = client.post("/shorten", json={"original_url": url})
+        if r.status_code == 200:
+            codes.append(r.json()["short_code"])
+        return r.status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        statuses = list(pool.map(lambda _: create(), range(10)))
+
+    # All requests succeeded
+    assert all(s == 200 for s in statuses), f"Not all 200: {statuses}"
+
+    # All returned codes are identical (only one row was ever created).
+    assert len(set(codes)) == 1, f"Expected one code, got {set(codes)}"
+
+    # Verify exactly one row exists for this URL.
+    db = test_database()
+    try:
+        count = (
+            db.query(func.count(URLMapping.id))
+            .filter(URLMapping.original_url == url)
+            .scalar()
+        )
+        assert count == 1, f"Expected 1 row, found {count}"
+    finally:
+        db.close()
+
+
+def test_short_code_collision_retries_and_succeeds(client, monkeypatch):
+    """Force a first-attempt collision; the retry loop must succeed.
+
+    We monkeypatch secrets.choice so the first 6 calls produce an
+    already-used code, then fall through to the normal random source.
+    The endpoint should survive the IntegrityError and complete with a
+    different short_code.
+    """
+    import secrets as _secrets
+
+    # Seed an existing mapping so we know which code is already taken.
+    first = client.post(
+        "/shorten", json={"original_url": "https://example.com/seed"}
+    ).json()
+    taken_code = first["short_code"]
+
+    # Count how many times the endpoint tries to generate a code.
+    original_choice = _secrets.choice
+    call_log = {"count": 0}
+
+    def patched_choice(alphabet):
+        call_log["count"] += 1
+        # For the first 6 calls (one full code), return chars from
+        # taken_code so the generated code matches exactly.
+        # After that, fall back to the real random source.
+        if call_log["count"] <= 6:
+            idx = call_log["count"] - 1
+            return taken_code[idx]
+        return original_choice(alphabet)
+
+    monkeypatch.setattr(_secrets, "choice", patched_choice)
+
+    # This request must NOT return 500. The retry loop should recover.
+    response = client.post(
+        "/shorten", json={"original_url": "https://example.com/collision-test"}
+    )
+    assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+    new_code = response.json()["short_code"]
+    assert new_code != taken_code, "Retry should have produced a different code"
+
+
 # ---------- Rate limiting ----------
 
 def test_rate_limit_returns_429_after_quota(client):
@@ -359,3 +443,19 @@ def test_rate_limit_returns_429_after_quota(client):
         statuses.append(r.status_code)
     assert 429 in statuses, f"Expected a 429, got {statuses}"
     assert statuses.count(200) <= 20
+
+def test_health_ready_metrics_are_reachable(client):
+    """The probe endpoints must not be intercepted by the /{short_code} catch-all."""
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code == 200
+    assert client.get("/metrics").status_code == 200
+    body = client.get("/metrics").text
+    assert "shortener_urls_total" in body
+    assert "shortener_redis_up" in body
+def test_ready_reports_db_and_redis(client):
+    """/ready must report db=true and redis=true when both are reachable."""
+    response = client.get("/ready")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["db"] is True, f"Expected db=True, got {body}"
+    assert body["redis"] is True, f"Expected redis=True, got {body}"

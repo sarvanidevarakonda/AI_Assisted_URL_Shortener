@@ -9,14 +9,15 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from sqlalchemy import update
+from sqlalchemy import func, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from config import BASE_URL, CACHE_TTL_SECONDS, RATE_LIMIT_SHORTEN
 from database import Base, engine, get_db, redis_client
 from models import URLMapping
 from schemas import AnalyticsResponse, URLRequest, URLResponse
@@ -198,12 +199,109 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 def _build_url_response(mapping: URLMapping) -> URLResponse:
     return URLResponse(
         short_code=mapping.short_code,
-        short_url=f"http://localhost:8000/{mapping.short_code}",
+        short_url=f"{BASE_URL}/{mapping.short_code}",
         original_url=mapping.original_url,
     )
 
 
-# ---------- Endpoints ----------
+def _pending_clicks_for(short_code: str) -> int:
+    """Count pending clicks for a code currently sitting in the Redis queue."""
+    items = _redis_call_with_timeout(
+        redis_client.lrange, CLICK_QUEUE_KEY, 0, -1, timeout=1.0
+    )
+    if not items:
+        return 0
+    return sum(1 for item in items if item == short_code)
+
+
+# ---------- Specific routes (MUST come before the /{short_code} catch-all) ----------
+
+@app.get("/health")
+def health():
+    """Liveness probe: process is up and can serve requests."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Readiness: DB and Redis are both reachable."""
+    from database import SessionLocal
+    db_ok = False
+    redis_ok = False
+
+    try:
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+        db.close()
+        db_ok = True
+    except Exception as exc:
+        logger.info(f"ready db_check_failed: {exc}")
+        db_ok = False
+
+    try:
+        redis_ok = bool(_redis_call_with_timeout(redis_client.ping, timeout=1.0))
+    except Exception:
+        redis_ok = False
+
+    status = "ok" if (db_ok and redis_ok) else "degraded"
+    return {"status": status, "db": db_ok, "redis": redis_ok}
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus-style metrics in plain text.
+
+    Exposes counters that a Prometheus scraper can pull. For the
+    prototype these are computed on-demand from the DB and Redis;
+    production would maintain them in-process as running counters.
+    """
+    from database import SessionLocal
+
+    lines = []
+
+    # Short URL count and persisted click count
+    db = SessionLocal()
+    try:
+        total = db.query(URLMapping).count()
+        lines.append("# HELP shortener_urls_total Total number of short URLs created")
+        lines.append("# TYPE shortener_urls_total counter")
+        lines.append(f"shortener_urls_total {total}")
+
+        total_clicks = db.query(func.sum(URLMapping.click_count)).scalar() or 0
+        lines.append(
+            "# HELP shortener_clicks_persisted_total Persisted click count across all URLs"
+        )
+        lines.append("# TYPE shortener_clicks_persisted_total counter")
+        lines.append(f"shortener_clicks_persisted_total {int(total_clicks)}")
+    finally:
+        db.close()
+
+    # Queue depth
+    try:
+        depth = _redis_call_with_timeout(
+            redis_client.llen, CLICK_QUEUE_KEY, timeout=1.0
+        )
+        depth = int(depth) if depth is not None else 0
+    except Exception:
+        depth = 0
+    lines.append(
+        "# HELP shortener_click_queue_depth Pending clicks not yet flushed to the DB"
+    )
+    lines.append("# TYPE shortener_click_queue_depth gauge")
+    lines.append(f"shortener_click_queue_depth {depth}")
+
+    # Redis health as a 0/1 gauge
+    redis_up = 1 if _redis_call_with_timeout(redis_client.ping, timeout=1.0) else 0
+    lines.append("# HELP shortener_redis_up 1 if Redis is reachable, 0 otherwise")
+    lines.append("# TYPE shortener_redis_up gauge")
+    lines.append(f"shortener_redis_up {redis_up}")
+
+    return PlainTextResponse(
+        "\n".join(lines) + "\n", media_type="text/plain; version=0.0.4"
+    )
+
+
+# ---------- POST /shorten ----------
 
 @app.post(
     "/shorten",
@@ -214,7 +312,7 @@ def _build_url_response(mapping: URLMapping) -> URLResponse:
         500: {"description": "Database error or unable to generate a unique code"},
     },
 )
-@limiter.limit("20/minute")
+@limiter.limit(RATE_LIMIT_SHORTEN)
 def shorten_url(
     request: Request,
     url_request: URLRequest,
@@ -232,7 +330,7 @@ def shorten_url(
             return _build_url_response(existing_mapping)
 
         alphabet = string.ascii_letters + string.digits
-        for _ in range(3):
+        for attempt in range(3):
             mapping = URLMapping(
                 original_url=url_request.original_url,
                 short_code="".join(secrets.choice(alphabet) for _ in range(6)),
@@ -245,6 +343,18 @@ def shorten_url(
                 return _build_url_response(mapping)
             except IntegrityError:
                 db.rollback()
+                # Two possibilities: (a) short_code collision (rare), or
+                # (b) another request created the same original_url first.
+                # For (b), re-query and return the existing mapping.
+                existing = (
+                    db.query(URLMapping)
+                    .filter(URLMapping.original_url == url_request.original_url)
+                    .first()
+                )
+                if existing is not None:
+                    logger.info(f"shorten race_recovered code={existing.short_code}")
+                    return _build_url_response(existing)
+                # Otherwise it was a code collision; retry with a new code.
 
         raise HTTPException(
             status_code=500,
@@ -257,6 +367,8 @@ def shorten_url(
         logger.info(f"shorten db_error: {exc}")
         raise HTTPException(status_code=500, detail="Database error") from exc
 
+
+# ---------- Catch-all and multi-segment routes (order matters: after specifics) ----------
 
 @app.get(
     "/{short_code}",
@@ -296,7 +408,7 @@ def redirect_to_original(short_code: str, db: Session = Depends(get_db)) -> Redi
             logger.info(f"redirect not_found code={short_code}")
             raise HTTPException(status_code=404, detail="Short URL not found")
 
-        _redis_set(cache_key, mapping.original_url, ttl=3600, timeout=1.0)
+        _redis_set(cache_key, mapping.original_url, ttl=CACHE_TTL_SECONDS, timeout=1.0)
         logger.info(f"redirect cache_miss code={short_code}")
 
         rpush_ok = _redis_call_with_timeout(
@@ -355,45 +467,3 @@ def get_analytics(short_code: str, db: Session = Depends(get_db)) -> AnalyticsRe
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail="Database error") from exc
-
-
-def _pending_clicks_for(short_code: str) -> int:
-    """Count pending clicks for a code currently sitting in the Redis queue."""
-    items = _redis_call_with_timeout(
-        redis_client.lrange, CLICK_QUEUE_KEY, 0, -1, timeout=1.0
-    )
-    if not items:
-        return 0
-    return sum(1 for item in items if item == short_code)
-
-
-# ---------- Health / readiness ----------
-
-@app.get("/health")
-def health():
-    """Liveness probe: process is up and can serve requests."""
-    return {"status": "ok"}
-
-
-@app.get("/ready")
-def ready():
-    """Readiness: DB and Redis are both reachable."""
-    from database import SessionLocal
-    db_ok = False
-    redis_ok = False
-
-    try:
-        db = SessionLocal()
-        db.execute(update(URLMapping).where(URLMapping.id == -1))
-        db.close()
-        db_ok = True
-    except Exception:
-        db_ok = False
-
-    try:
-        redis_ok = bool(_redis_call_with_timeout(redis_client.ping, timeout=1.0))
-    except Exception:
-        redis_ok = False
-
-    status = "ok" if (db_ok and redis_ok) else "degraded"
-    return {"status": status, "db": db_ok, "redis": redis_ok}
