@@ -15,36 +15,45 @@ I built a URL shortener with three HTTP endpoints (`POST /shorten`,
 cache and queue layer. The design deliberately kept each concern in its
 own module:
 
+- `config.py` — environment-driven configuration
 - `database.py` — engine, session lifecycle, and Redis client
 - `models.py` — persistent entity
-- `schemas.py` — request/response contracts
-- `main.py` — routing, caching, queue-based click tracking, and a
-  background flush worker
+- `schemas.py` — request/response contracts with structural URL validation
+- `main.py` — routing, caching, queue-based click tracking, background
+  flush worker, structured logging, rate limiting
 - `benchmark.py` — three-path latency comparison
+- `workflow.py` — requirement-to-engineering workflow tool
 
 GitHub Copilot (Agent Mode) generated the first draft of each module. I
 then reviewed every line, corrected deprecated APIs, added missing
 constraints, redesigned the caching layer to eliminate the DB write
-from the hot path, and validated behavior with an 11-test pytest suite
-that uses per-test database isolation.
+from the hot path, and validated behavior with an 18-test pytest suite
+that uses per-test database isolation. CI runs the same suite on every
+push against a real Redis 7 service on Ubuntu.
 
 The intent was not to maximize AI output — it was to demonstrate that
 AI accelerates *while the engineer retains ownership*. That ownership
-is visible in `AI_LOG.md`, which records the prompt used for each
-component, what Copilot produced, and what I changed.
+is visible in `AI_LOG.md` (per-file prompt/output/review record) and
+`AI_EVIDENCE.md` (four concrete cases where an AI suggestion was
+rejected, corrected, or redesigned, each tied to a repeatable command).
 
 ## 2. Generated Artifacts
 
 | Artifact | Purpose |
 |----------|---------|
+| `config.py` | Environment-driven settings (BASE_URL, rate limit, Redis, cache TTL) |
 | `database.py` | SQLAlchemy engine, `SessionLocal`, `Base`, `get_db()`, `redis_client` |
 | `models.py` | `URLMapping` table with indexed, unique `short_code` |
-| `schemas.py` | Pydantic v2 models with URL validation |
-| `main.py` | FastAPI app with lifespan handler, 5 endpoints, queue-based click tracking, background flush worker, fail-open timeout wrapper |
+| `schemas.py` | Pydantic v2 models with structural URL validation |
+| `main.py` | FastAPI app: 5 endpoints, queue-based click tracking, background worker, fail-open wrapper, structured JSON logging, rate limiting |
 | `ClickFlushWorker` (in `main.py`) | Background thread; drains the Redis click queue into SQLite every 5s |
 | `benchmark.py` | Three-path latency comparison (DB-only, cache+DB, cache+queue) |
-| `tests/test_main.py` | 11 endpoint tests with temp DB per test |
+| `workflow.py` | Requirement-to-engineering workflow CLI |
+| `examples/` | Three sample requirement inputs (greenfield, brownfield, ambiguous) |
+| `tests/test_main.py` | 18 endpoint tests with temp DB per test |
+| `.github/workflows/tests.yml` | GitHub Actions CI: pytest against Redis 7 |
 | `AI_LOG.md` | Per-file prompt/output/validation record |
+| `AI_EVIDENCE.md` | Four verifiable examples of AI suggestions rejected/corrected |
 | `ARCHITECTURE.md` | System design, cache model, AI integration, trade-offs |
 | `SCENARIOS.md` | Greenfield / brownfield / ambiguous walkthroughs |
 | `README.md` | Setup, API reference, testing, quick verification |
@@ -64,17 +73,19 @@ Three layers of validation:
 - `Base.metadata.create_all()` confirmed the table was created
 - `sqlite_master` inspection confirmed the schema
 - Redis client verified via `SET`/`GET` smoke test
+- `/health` and `/ready` probes verified DB + Redis reachability
 
 **Behavioral**
-- 11 pytest cases covering valid/invalid input, idempotency, redirect
-  status + location, cache hit path, cache miss path, fail-open on
-  Redis outage, analytics increment, 404 paths, and **20 concurrent
-  redirects producing exactly 20 clicks** after queue flush
+- 18 pytest cases covering valid/invalid input, URL structural
+  validation, idempotency, redirect status + location, cache hit path,
+  cache miss path, fail-open on Redis outage, analytics increment,
+  404 paths, **20 concurrent redirects producing exactly 20 clicks**
+  after queue flush, and **rate-limit enforcement (429 after quota)**
 - Manual curl tests during development
 - Benchmark: 1,000 iterations per scenario across three handler paths
+- CI: the same 18 tests run on Ubuntu + Redis 7 on every push
 
-Final state: **11 passed, 2 warnings** in ~24s. The two remaining
-warnings are upstream (Starlette/httpx, anyio) and not project code.
+Final state: **18 passed, 0 warnings**.
 
 ## 3a. Performance and Scale Notes
 
@@ -94,15 +105,18 @@ clearly what was measured and what was not.
   transaction, so the DB sees far fewer writes under load
 - Thread-pool timeout wrapping every Redis call, so fail-open latency
   is bounded at ~1s regardless of OS socket behavior
+- Configuration externalized to `config.py` (env-driven)
+- Rate limiting on `POST /shorten` via slowapi
 
 **What is measured:**
-- Benchmark of three handler paths (1,000 iterations each, `benchmark.py`):
-  1. DB-only (pre-cache): `SELECT` + `UPDATE` → **8.07 ms avg**
-  2. Cache + DB write: Redis `GET` + `UPDATE` → **7.74 ms avg**
-  3. **Cache + queue (hot path): Redis `GET` + `RPUSH` → 0.29 ms avg**
-- **Hot-path speedup vs pre-cache: 27.6×.**
-- Cache-only design (option 2) gave only ~4% improvement because the
-  DB write dominated. Moving clicks to a queue removed the write
+- Benchmark of three handler paths (1,000 iterations each, two runs,
+  `benchmark.py`):
+  1. DB-only (pre-cache): `SELECT` + `UPDATE` → **8.1 – 25.8 ms avg**
+  2. Cache + DB write: Redis `GET` + `UPDATE` → **7.7 – 24.7 ms avg**
+  3. **Cache + queue (hot path): Redis `GET` + `RPUSH` → 0.3 – 0.6 ms avg**
+- **Hot-path speedup vs pre-cache: 27.6× – 40.8×** across two runs.
+- The cache-only design (option 2) gave only ~4% improvement because
+  the DB write dominated. Moving clicks to a queue removed the write
   entirely — that is where the real gain comes from.
 - Concurrent-click correctness: 20 parallel redirects → final count
   is exactly 20 after queue flush (verified in
@@ -134,25 +148,31 @@ each claim independently.
 
 | Claim | How It Was Verified | Observed Result |
 |-------|---------------------|-----------------|
-| Test suite passes | `python -m pytest tests/ -v` | `11 passed, 2 warnings in ~24s` |
+| Test suite passes | `python -m pytest tests/ -v` | `18 passed, 0 warnings` |
+| CI passes | GitHub Actions on every push | Green (Ubuntu + Redis 7) |
 | Database table created | `Base.metadata.create_all()` at startup; `sqlite_master` query | `[('url_mappings',)]` |
 | Index on `short_code` | Introspection: `URLMapping.short_code.index` | `True` |
 | Unique constraint | Introspection: `URLMapping.short_code.unique` | `True` |
 | Not nullable | Introspection: `URLMapping.short_code.nullable` | `False` |
-| URL validation rejects bad input | `POST /shorten` with `{"original_url": "notaurl"}` | `422` with `"must start with http:// or https://"` |
+| URL validation rejects bad scheme | `POST /shorten` with `"notaurl"` | `422` |
+| URL validation rejects missing host | `POST /shorten` with `"https://"` | `422` |
+| URL validation rejects whitespace | `POST /shorten` with `"https://exa mple.com"` | `422` |
+| URL validation accepts localhost | `POST /shorten` with `"http://localhost:8000/path"` | `200` |
+| URL validation trims edges | `POST /shorten` with `"  https://example.com  "` | `200`, trimmed |
 | Idempotent creation | `POST /shorten` twice with same URL | Same `short_code` both times |
 | Redirect works | Server log during manual test | `"GET /u7o6u1 HTTP/1.1" 307` |
 | Analytics increments | `GET /analytics/{code}` after one redirect | `click_count` incremented |
 | 404 for unknown code | `GET /zzzzzz` | `404` with `{"detail": "Short URL not found"}` |
 | OpenAPI metadata documents 307/404 | `/docs` after `responses=` addition | Swagger UI shows both status codes |
 | Redis URL cache populates on miss | `redis_client.get('url:{code}')` after a redirect | Original URL stored |
-| Cache hit doesn't call Redis SET | `test_redirect_cache_hit_uses_cached_url_and_increments_clicks` | PASSED — `set_calls == []` |
+| Cache hit doesn't call Redis SET | `test_redirect_cache_hit_uses_cached_url_and_increments_clicks` | PASSED |
 | TTL applied to URL cache | `redis_client.ttl('url:{code}')` | Positive value < 3600 |
-| Cache-hit click is queued, not written | `test_redirect_cache_hit_uses_cached_url_and_increments_clicks` | PASSED — analytics reads queue depth |
-| **20 concurrent clicks → exact count** | `test_concurrent_clicks_are_counted_correctly` | PASSED — count == 20 after flush |
+| Cache-hit click is queued, not written | `test_redirect_cache_hit_uses_cached_url_and_increments_clicks` | PASSED |
+| **20 concurrent clicks → exact count** | `test_concurrent_clicks_are_counted_correctly` | PASSED |
 | Fail-open works (mocked) | `test_redirect_fails_open_when_redis_is_down` | PASSED |
 | Fail-open works (real outage) | Stopped Memurai, hit redirect URL | Redirect succeeded in ~1–2 s |
-| **Hot-path speedup** | `python benchmark.py` | 0.29 ms vs 8.07 ms = **27.6×** |
+| Rate limit enforces 429 | `test_rate_limit_returns_429_after_quota` | PASSED |
+| **Hot-path speedup** | `python benchmark.py` | 0.3 – 0.6 ms vs 8 – 26 ms = **27.6× – 40.8×** |
 
 **Note on the redirect via Swagger:** Swagger's "Execute" button
 triggers a CORS block when the endpoint returns a 307 to an external
@@ -177,6 +197,8 @@ instead. This is documented in `README.md`.
 | Redis socket hang on Windows | Availability | Thread-pool future timeout wraps every Redis call at 1s |
 | Worker flush failure | Data integrity | Popped items re-queued so no click is lost |
 | Worker targets wrong DB in tests | Test correctness | `ClickFlushWorker(session_factory=...)` injection |
+| Config drift between envs | Ops | All settings in `config.py` from env vars |
+| Abuse / spam creation | Security | slowapi rate limit on `POST /shorten` (20/min) |
 | Copilot runtime misdiagnosis | AI-related | Cross-check every "not installed" claim in the active venv |
 | Copilot scaffolding not wired in | AI-related | Verify generated helpers are actually called; read the diff |
 
@@ -206,14 +228,17 @@ introduced an indentation error on the replacement line.
 review the diff, not just the new code; catch issues with `py_compile`
 and manual testing.
 
-None of these were fatal, but all three illustrate why ownership
-cannot be delegated to the AI.
+`AI_EVIDENCE.md` documents four concrete cases where these patterns
+were caught, with the specific diff, test evidence, and a repeatable
+command for each.
 
 ## 6. Assumptions and Limitations
 
 - SQLite is used for simplicity; production would use PostgreSQL.
-- Short URLs are hardcoded to `http://localhost:8000`.
-- No authentication, rate limiting, or abuse protection.
+- Short URL base is configurable via `BASE_URL` (default `http://localhost:8000`).
+- Rate limiting is per-IP via slowapi (in-memory storage). Production
+  would use a shared backend (Redis) for multi-instance deployments.
+- No authentication or API keys yet.
 - Analytics is a single integer `click_count` — no time-series.
 - No custom aliases, expiry, or link deactivation.
 - The single-segment route `/{short_code}` would need reordering or a
@@ -228,7 +253,6 @@ cannot be delegated to the AI.
   pending queue depth.
 - HTTP-layer load testing (concurrent clients, sustained RPS) not
   performed. Backend lookup latency is benchmarked; see §3a.
-- Two upstream deprecation warnings remain (Starlette/httpx, anyio).
 
 ## 7. What Success Looks Like (Self-Assessment)
 
@@ -236,13 +260,13 @@ Against the assignment's own success criteria:
 
 | Criterion | Evidence |
 |-----------|----------|
-| Effective use of AI tools | `AI_LOG.md` — prompt, output, and review per file; specific rejection logged |
-| Strength of software design | Layered modules, indexed model, Pydantic validation, cache + queue design |
-| Quality and correctness | 11/11 tests pass; 20-way concurrent click test; manual curl verified; benchmark recorded |
+| Effective use of AI tools | `AI_LOG.md` + `AI_EVIDENCE.md` — prompt, output, review, and four concrete rejections with diffs |
+| Strength of software design | Layered modules, indexed model, structural URL validation, cache + queue design, rate limiting, env-driven config |
+| Quality and correctness | 18/18 tests pass; CI green; 20-way concurrent click test; manual curl verified; benchmark recorded |
 | Demonstrated ownership | Every AI output reviewed; deprecated APIs corrected; queue design engineer-directed; unwired helpers caught |
-| Validation rigor | Static + runtime + behavioral + benchmark + concurrency documented |
-| Clarity and defensibility | Four docs + log; every choice has a rationale |
-| Controlled autonomy | Engineer-led decomposition; AI execution per task |
+| Validation rigor | Static + runtime + behavioral + benchmark + concurrency + CI, all documented |
+| Clarity and defensibility | Five docs + log + evidence; every choice has a rationale |
+| Controlled autonomy | Engineer-led decomposition; AI execution per task; requirement-to-engineering workflow tool |
 
 ## 8. Final Reflection
 
@@ -261,7 +285,7 @@ decisions were mine:
    path, I noticed the cache wasn't actually saving a DB round-trip.
    Benchmarking confirmed it: caching the URL alone gave ~4%
    improvement. Moving clicks to a Redis queue removed the DB write
-   from the hot path entirely and produced a 27.6× speedup.
+   from the hot path entirely and produced a 27.6×–40.8× speedup.
 2. **Thread-pool timeout for fail-open.** `socket_connect_timeout=1`
    on Windows does not honor the timeout when the port is unreachable
    — a real outage test showed 52-second redirects. Wrapping Redis
@@ -272,9 +296,10 @@ decisions were mine:
    test DB — otherwise it silently wrote to the production database
    and the concurrency test returned 0.
 
-The log is the artifact I'd point to first: it records the exact
-prompts, the exact outputs, and the exact corrections — a paper trail
-that makes the ownership claim verifiable rather than asserted.
+The log and evidence file are the artifacts I'd point to first: they
+record the exact prompts, the exact outputs, the exact corrections,
+and a repeatable command to verify each. That makes the ownership
+claim verifiable rather than asserted.
 
 **AI assists the engineer within tasks; the engineer owns execution
 and quality.** This project is my attempt to demonstrate that in a
