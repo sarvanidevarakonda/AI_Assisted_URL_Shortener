@@ -452,6 +452,18 @@ def test_health_ready_metrics_are_reachable(client):
     body = client.get("/metrics").text
     assert "shortener_urls_total" in body
     assert "shortener_redis_up" in body
+
+
+def test_metrics_reflect_test_database(client):
+    """After creating one short URL, /metrics must report exactly 1 URL.
+    This verifies that /metrics uses the dependency-injected DB session,
+    not a direct SessionLocal() import — which would query the production
+    DB in tests.
+    """
+    client.post("/shorten", json={"original_url": "https://metrics-test.example.com"})
+
+    body = client.get("/metrics").text
+    assert "shortener_urls_total 1" in body, f"Unexpected metrics body:\n{body}"
 def test_ready_reports_db_and_redis(client):
     """/ready must report db=true and redis=true when both are reachable."""
     response = client.get("/ready")

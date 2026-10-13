@@ -223,16 +223,17 @@ def health():
 
 
 @app.get("/ready")
-def ready():
-    """Readiness: DB and Redis are both reachable."""
-    from database import SessionLocal
+def ready(db: Session = Depends(get_db)):
+    """Readiness: DB and Redis are both reachable.
+
+    Uses the request-scoped DB session (via Depends) so tests that
+    override get_db also see the correct database.
+    """
     db_ok = False
     redis_ok = False
 
     try:
-        db = SessionLocal()
         db.execute(text("SELECT 1"))
-        db.close()
         db_ok = True
     except Exception as exc:
         logger.info(f"ready db_check_failed: {exc}")
@@ -248,33 +249,25 @@ def ready():
 
 
 @app.get("/metrics")
-def metrics():
+def metrics(db: Session = Depends(get_db)):
     """Prometheus-style metrics in plain text.
 
-    Exposes counters that a Prometheus scraper can pull. For the
-    prototype these are computed on-demand from the DB and Redis;
-    production would maintain them in-process as running counters.
+    Uses the request-scoped DB session (via Depends) so tests that
+    override get_db also see the correct database.
     """
-    from database import SessionLocal
-
     lines = []
 
-    # Short URL count and persisted click count
-    db = SessionLocal()
-    try:
-        total = db.query(URLMapping).count()
-        lines.append("# HELP shortener_urls_total Total number of short URLs created")
-        lines.append("# TYPE shortener_urls_total counter")
-        lines.append(f"shortener_urls_total {total}")
+    total = db.query(URLMapping).count()
+    lines.append("# HELP shortener_urls_total Total number of short URLs created")
+    lines.append("# TYPE shortener_urls_total counter")
+    lines.append(f"shortener_urls_total {total}")
 
-        total_clicks = db.query(func.sum(URLMapping.click_count)).scalar() or 0
-        lines.append(
-            "# HELP shortener_clicks_persisted_total Persisted click count across all URLs"
-        )
-        lines.append("# TYPE shortener_clicks_persisted_total counter")
-        lines.append(f"shortener_clicks_persisted_total {int(total_clicks)}")
-    finally:
-        db.close()
+    total_clicks = db.query(func.sum(URLMapping.click_count)).scalar() or 0
+    lines.append(
+        "# HELP shortener_clicks_persisted_total Persisted click count across all URLs"
+    )
+    lines.append("# TYPE shortener_clicks_persisted_total counter")
+    lines.append(f"shortener_clicks_persisted_total {int(total_clicks)}")
 
     # Queue depth
     try:
