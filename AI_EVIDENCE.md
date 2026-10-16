@@ -19,7 +19,9 @@ The helpers existed but were never invoked.
 **Fix:** Changed `cached_url = redis_client.get(cache_key)` to
 `cached_url = _redis_get_with_timeout(cache_key, timeout=1.0)`.
 
-**Evidence:**
+**Evidence:** The test stubs Redis to raise on `get`, then asserts the
+redirect still returns 307. This is the exact scenario that took 52
+seconds before the timeout wrapper was wired in.
 
     python -m pytest tests/test_main.py::test_redirect_fails_open_when_redis_is_down -v
 
@@ -86,7 +88,7 @@ doing its job.
 with no DB touch. A background worker drains the click queue every
 5 seconds and applies batched atomic increments.
 
-**Evidence:**
+**Evidence (benchmark):**
 
     python benchmark.py
 
@@ -94,11 +96,11 @@ Expected output:
 
     Scenario                          Avg (ms)   Median (ms)   P99 (ms)
     -------------------------------------------------------------------
-    DB-only (pre-cache)               8.07       7.58          13.25
-    Cache + DB write (intermediate)   7.74       7.38          10.96
-    Cache + queue (hot path)          0.29       0.27          0.56
+    DB-only (pre-cache)               8.1-25.8   7.6-11.2      13-247
+    Cache + DB write (intermediate)   7.7-24.7   7.4-10.9      11-245
+    Cache + queue (hot path)          0.3-0.6    0.3-0.6       0.6-1.0
 
-    Hot-path speedup vs pre-cache: 27.6x
+    Hot-path speedup vs pre-cache: 27.6x - 40.8x across two runs.
 
 **Evidence (test):**
 
@@ -108,11 +110,96 @@ Expected: `PASSED` (20 parallel redirects produce exactly 20 clicks after flush)
 
 ---
 
+## Example 5: Concurrent duplicate-creation race (caught by new test)
+
+**Context:** The client asked for a test that fires simultaneous
+duplicate `POST /shorten` calls to prove the endpoint is idempotent
+under concurrency.
+
+**What the test found:** The test **failed on first run**. Ten
+concurrent POSTs for the same URL produced **three different
+short_codes and three duplicate rows** in the database. Two requests
+had raced past the idempotent pre-check and each inserted a new row
+before the others saw the committed data.
+
+**Root cause:** The `original_url` column had no unique constraint.
+The idempotency check was app-level only (`SELECT` then `INSERT`), and
+that pattern is inherently racy without a DB constraint backing it.
+
+**Fix:**
+1. Added `unique=True, index=True` to `URLMapping.original_url` in
+   `models.py`.
+2. Extended the `IntegrityError` handler in `shorten_url` to re-query
+   and return the existing mapping when the collision was on
+   `original_url` (vs a short_code collision, which retries).
+
+**Evidence:**
+
+    python -m pytest tests/test_main.py::test_simultaneous_duplicate_creation_returns_same_code -v
+
+Expected: `PASSED`. The test also asserts exactly one row exists in
+the DB for the raced URL.
+
+**Why this matters:** The reviewer's feedback explicitly asked for this
+test. Writing it surfaced a real correctness bug that would have
+silently created duplicate rows under concurrent load. The test
+remains in the suite to guard against regression.
+
+---
+
+## Example 6: `/metrics` bypassed the test DB (caught by CI)
+
+**Context:** After adding the `/metrics` endpoint, all tests passed
+locally. CI failed with:
+
+    sqlite3.OperationalError: no such table: url_mappings
+
+**Root cause:** The `/metrics` handler imported `SessionLocal` from
+`database` and used it directly instead of the FastAPI dependency
+`get_db`. Because the test suite overrides `get_db` to point at an
+isolated temp DB, the direct `SessionLocal()` call bypassed the
+override and hit the (nonexistent) production DB on the CI runner.
+
+The `/ready` endpoint had the same problem in principle, but its
+`SELECT 1` check doesn't reference a table, so it happened to pass.
+
+**Fix:** Changed both handlers to accept `db: Session = Depends(get_db)`:
+
+    @app.get("/ready")
+    def ready(db: Session = Depends(get_db)): ...
+
+    @app.get("/metrics")
+    def metrics(db: Session = Depends(get_db)): ...
+
+**Evidence:**
+
+    python -m pytest tests/test_main.py::test_metrics_reflect_test_database -v
+
+Expected: `PASSED`. The test creates one short URL, then asserts
+`shortener_urls_total 1` appears in the metrics body. This can only
+be true if `/metrics` reads from the test DB (via the dependency
+override), not the production DB.
+
+**Why this matters:** This bug was invisible locally because a
+`./shortener.db` file existed on the developer machine. CI runs on a
+clean runner with no such file, so the direct `SessionLocal()` call
+failed. This is a concrete example of why the reviewer's request for
+a **reproducible environment / CI** matters — environment-specific
+bugs only surface when you run in a clean environment.
+
+---
+
 ## How to Verify This Entire Document
 
     git clone https://github.com/sarvanidevarakonda/AI_Assisted_URL_Shortener.git
+    cd AI_Assisted_URL_Shortener
+    python -m venv .venv
+    # Windows:
+    .\.venv\Scripts\Activate.ps1
+    # macOS/Linux:
+    source .venv/bin/activate
     python -m pip install -r requirements.txt
-    python -m pytest tests/ -v          # expect 18 passed
+    python -m pytest tests/ -v          # expect 23 passed, 0 warnings
     python benchmark.py                 # expect ~0.3 ms hot path
 
 Every claim above is reproducible with the commands shown.
